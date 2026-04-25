@@ -266,9 +266,58 @@ func buildTasks(st sharding.ShardingType) []shardTask {
 
 // ---------- Shard-level seeding ----------
 
+// shardState describes the current persistence state of a shard across all its splits.
+type shardState struct {
+	totalRows       int // rows already in the DB across all splits
+	currentSplit    int // highest split that exists (1-based)
+	currentSplitRows int // row count in that split (determines remaining capacity)
+}
+
+// inspectExistingSplits walks split tables _1, _2, _3 … until one is missing,
+// returning the aggregate row count and the state of the last existing split.
+// A brand-new shard (split _1 just created by mysql_schema but empty) returns
+// shardState{0, 1, 0} so seeding starts cleanly into _1.
+func inspectExistingSplits(db *sql.DB, task shardTask) (shardState, error) {
+	var st shardState
+	st.currentSplit = 1
+
+	for n := 1; ; n++ {
+		var count int
+		err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM customers_%s", task.suffix(n))).Scan(&count)
+		if err != nil {
+			// Table does not exist — n-1 was the last split.
+			st.currentSplit = n - 1
+			if st.currentSplit < 1 {
+				st.currentSplit = 1
+				st.currentSplitRows = 0
+			}
+			return st, nil
+		}
+		st.totalRows += count
+		st.currentSplitRows = count
+		st.currentSplit = n
+	}
+}
+
 func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, task shardTask, sharedPool []string) error {
-	splitNum := 1
-	splitRowCount := 0
+	existing, err := inspectExistingSplits(db, task)
+	if err != nil {
+		return fmt.Errorf("inspect splits: %w", err)
+	}
+
+	toInsert := *recordsPerShard - existing.totalRows
+	if toInsert <= 0 {
+		log.Printf("  shard %s: already at %d rows (target %d), skipping",
+			task.key(), existing.totalRows, *recordsPerShard)
+		return nil
+	}
+	if existing.totalRows > 0 {
+		log.Printf("  shard %s: resuming — %d existing rows, inserting %d more",
+			task.key(), existing.totalRows, toInsert)
+	}
+
+	splitNum := existing.currentSplit
+	splitRowCount := existing.currentSplitRows
 
 	var allCustomers []customerRecord
 
@@ -340,7 +389,7 @@ func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, 
 		return nil
 	}
 
-	for i := 0; i < *recordsPerShard; i++ {
+	for i := 0; i < toInsert; i++ {
 		// Check if we've hit the split cap — flush first, then advance split.
 		if splitRowCount >= sharding.SplitRowCap {
 			if err := flushCustomers(); err != nil {

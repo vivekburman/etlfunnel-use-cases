@@ -8,7 +8,8 @@
 #   make mysql       — create MySQL sharded schemas on all 4 source DBs
 #   make postgres    — create destination Postgres schemas (raw/staging/curated/audit + partitions)
 #   make auxdb       — create AuxDB schemas + seed plan_mapping, terminate_rules, write_tune_config
-#   make seed        — insert synthetic telecom data into all 4 MySQL source DBs
+#   make seed        — insert synthetic telecom data (500 rec/shard, smoke-test volume)
+#   make seed-scale  — production-scale seed (1.1M rec/shard, triggers dynamic table splits)
 #   make setup       — run ALL of the above in order (full bootstrap)
 #   make down        — stop and remove containers (keeps volumes)
 #   make reset       — stop containers AND destroy volumes (DESTRUCTIVE)
@@ -70,6 +71,14 @@ seed: deps
 	@echo ">>> Seeding synthetic data ($(RECORDS_PER_SHARD) records/shard, $(WORKERS) workers)..."
 	go run ./cmd/seeder --records-per-shard=$(RECORDS_PER_SHARD) --workers=$(WORKERS)
 	@echo ">>> Seeding done"
+
+## Production-scale seed — 1.1M records/shard guarantees at least one dynamic split per shard.
+## Runtime: long (tens of minutes). Ensure Docker containers have sufficient disk + memory.
+seed-scale: deps
+	@echo ">>> Production-scale seeding (1100000 records/shard, $(WORKERS) workers)..."
+	@echo ">>> Each shard will overflow 1M rows and trigger dynamic split _2 creation."
+	go run ./cmd/seeder --records-per-shard=1100000 --workers=$(WORKERS)
+	@echo ">>> Scale seeding done"
 
 ## Full bootstrap: up → mysql → postgres → auxdb → seed
 setup: up mysql postgres auxdb seed
