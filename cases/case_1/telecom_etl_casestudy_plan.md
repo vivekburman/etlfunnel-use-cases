@@ -32,17 +32,39 @@ This case study models a real-world telecom consolidation where four acquired co
 - Central: MP, Chhattisgarh
 
 **Tier 3 — Table-level splitting within a shard:**
-- Each state-level table is capped at **1 million rows**
-- When a table grows beyond 1M rows, it splits into numbered child tables:
+- Each shard table is capped at **1 million rows** (`SplitRowCap`)
+- When a table grows beyond 1M rows, the seeder creates the next numbered split on the fly:
   - `customers_north_up_1`, `customers_north_up_2`, `customers_north_up_3` …
-- The pipeline connector handles querying across all splits for a given state shard
+- `mysql_schema` only creates split `_1` at setup time; splits `_2`, `_3` … are created dynamically at seeding time (and by the source connector at ingest time in production)
+- The pipeline connector handles querying across all splits for a given shard
 
-### 1.3 Core Source Tables (per company, per shard)
-- `customers_{zone}_{state}_{n}` — customer identity, PII, contact
-- `subscriptions_{zone}_{state}_{n}` — active/historical plan enrollments
-- `billing_accounts_{zone}_{state}_{n}` — billing cycle, dues, payment history
-- `sim_inventory_{zone}_{state}_{n}` — SIM serial, IMSI, activation date
-- `port_history_{zone}_{state}_{n}` — MNP in/out events
+### 1.3 Per-Company Sharding Strategy
+
+Each acquired company used a different geographic organisation for its data before the merger.
+Not all companies sharded by both zone and state — this divergence is intentional and exercises
+the `GeoTagger` transformer which injects the missing geo dimension from pipeline context.
+
+| Company | Sharding Type | Table name pattern | Geo columns present |
+|---|---|---|---|
+| Vodafone | Zone + State | `customers_north_up_1` | `zone`, `state` |
+| Idea | Zone only | `customers_north_1` | `zone` only |
+| Tata Docomo | State only | `customers_up_1` | `state` only |
+| Aircel | Zone + State | `customers_north_up_1` | `zone`, `state` |
+
+> **Why this matters for the ETL:** The `SchemaMapper` normalises column names; the `GeoTagger`
+> fills in the missing geo dimension (e.g. injects `state` for Idea records, `zone` for Tata
+> Docomo records) using the pipeline's shard context so the destination always has both fields.
+
+### 1.4 Core Source Tables (per company, per shard)
+
+Table name patterns vary by company sharding type (see §1.3). The `{geo}` placeholder represents
+the zone, state, or zone+state key depending on the company.
+
+- `customers_{geo}_{n}` — customer identity, PII, contact
+- `subscriptions_{geo}_{n}` — active/historical plan enrollments
+- `billing_accounts_{geo}_{n}` — billing cycle, dues, payment history
+- `sim_inventory_{geo}_{n}` — SIM serial, IMSI, activation date
+- `port_history_{geo}_{n}` — MNP in/out events
 
 ---
 
@@ -327,8 +349,8 @@ Each lane writes to a non-overlapping Postgres partition — zero contention.
 ### Phase 1 — Infrastructure Setup
 
 - [ ] **STEP-01** — Provision 4 MySQL source instances (one per company: Vodafone, Idea, Tata Docomo, Aircel)
-- [ ] **STEP-02** — Design and create source schema for each company with zone/state sharding and table-split naming convention (`customers_{zone}_{state}_{n}`)
-- [ ] **STEP-03** — Seed source databases with realistic synthetic telecom data (customers, subscriptions, billing, SIM inventory, port history) — target 3–5M records per company
+- [ ] **STEP-02** — Design and create source schema for each company with per-company sharding strategy (zone+state / zone-only / state-only) and split naming convention (`customers_{geo}_1`). `mysql_schema` creates only split `_1`; subsequent splits are created dynamically when the 1M-row cap is hit.
+- [ ] **STEP-03** — Seed source databases with realistic synthetic telecom data (customers, subscriptions, billing, SIM inventory, port history) — target 3–5M records per company. Use `--records-per-shard` flag; splits `_2`, `_3` … are auto-created by the seeder when `SplitRowCap` (1,000,000) is reached. Child tables (subscriptions, billing, sim, port) are seeded into the same split as their parent customer rows.
 - [ ] **STEP-04** — Provision destination Postgres instance (Airtel / Jio)
 - [ ] **STEP-05** — Create `raw`, `staging`, `curated`, `audit` schemas on destination Postgres
 - [ ] **STEP-06** — Create destination tables with declarative partitioning (zone → state → batch range)
@@ -411,7 +433,7 @@ Each lane writes to a non-overlapping Postgres partition — zero contention.
 | Dimension | Detail |
 |---|---|
 | Source DBs | 4 MySQL instances (Vodafone, Idea, Tata Docomo, Aircel) |
-| Sharding | Zone (5) → State (36 total) → Table splits (1M row cap) |
+| Sharding | Per-company: Zone+State (Vodafone, Aircel) / Zone-only (Idea) / State-only (Tata Docomo). Splits at 1M rows cap, created dynamically. |
 | Total Flows | 20 (4 companies × 5 zones) |
 | Total Pipelines | ~140 (avg 7 states per zone) |
 | Peak Concurrency | 8 flows × 3 pipelines = 24 active workers |

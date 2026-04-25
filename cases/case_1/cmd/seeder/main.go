@@ -3,15 +3,21 @@
 // Usage:
 //   go run ./cmd/seeder [--records-per-shard N]
 //
-// Default: 500 records per shard (zone+state+split combination).
-// For a production-scale run targeting ~3M records per company, use --records-per-shard 5000.
+// Default: 500 records per shard.
+// Dynamic table splits: when a shard table reaches sharding.SplitRowCap (1,000,000 rows),
+// the seeder creates the next split table on the fly (_2, _3, …) and continues inserting there.
 //
-// Each company gets its own column names (matching companySchemas in mysql_schema).
-// Intentional data quality issues are injected to exercise the transformer chain:
-//   - ~3% null MSISDNs  (triggers NullHandler / Backlog)
-//   - ~5% duplicate MSISDNs across companies (triggers DedupChecker)
-//   - ~2% invalid plan codes (triggers PlanMapper backlog path)
-//   - ~1% unparseable dates
+// Sharding strategy per company:
+//   vodafone    — zone + state  (customers_north_up_1, _2, …)
+//   idea        — zone only     (customers_north_1, _2, …)
+//   tata_docomo — state only    (customers_up_1, _2, …)
+//   aircel      — zone + state  (customers_north_up_1, _2, …)
+//
+// Intentional data quality issues injected to exercise the transformer chain:
+//   ~3% null MSISDNs  (triggers NullHandler / Backlog)
+//   ~5% duplicate MSISDNs across companies (triggers DedupChecker)
+//   ~2% invalid plan codes (triggers PlanMapper backlog path)
+//   ~1% unparseable dates
 
 package main
 
@@ -32,7 +38,7 @@ import (
 )
 
 var (
-	recordsPerShard = flag.Int("records-per-shard", 500, "number of customer records to insert per zone+state+split shard")
+	recordsPerShard = flag.Int("records-per-shard", 500, "number of customer records to insert per shard")
 	workers         = flag.Int("workers", 4, "parallel worker goroutines per company")
 )
 
@@ -85,7 +91,6 @@ var colMap = map[string]companyColumns{
 	},
 }
 
-// Source plan codes per company (must match plan_mapping seed)
 var sourcePlanCodes = map[string][]string{
 	"vodafone":    {"VF_49", "VF_149", "VF_299", "VF_599", "VF_999", "VF_PREPAID_10"},
 	"idea":        {"ID_49", "ID_199", "ID_349", "ID_449", "ID_595", "ID_1199"},
@@ -107,20 +112,55 @@ var lastNames = []string{
 	"Chatterjee", "Mukherjee", "Bose", "Das", "Mishra", "Pandey", "Tiwari", "Dubey",
 }
 
+// ---------- Shard task ----------
+
+// shardTask identifies a single shard to seed.
+// For zone-only companies, state is empty. For state-only, zone is empty.
 type shardTask struct {
 	zone  string
 	state string
-	split int
 }
+
+// key returns a unique string for this shard (used for logging).
+func (t shardTask) key() string {
+	if t.zone != "" && t.state != "" {
+		return t.zone + "_" + t.state
+	}
+	if t.zone != "" {
+		return t.zone
+	}
+	return t.state
+}
+
+// suffix builds the table name suffix for a given split number.
+func (t shardTask) suffix(split int) string {
+	return fmt.Sprintf("%s_%d", t.key(), split)
+}
+
+// hasZone / hasState report which geo dimensions are present for this company's sharding type.
+// They are derived from which fields are populated, so we don't need to thread ShardingType
+// all the way down into every helper.
+func (t shardTask) hasZone() bool  { return t.zone != "" }
+func (t shardTask) hasState() bool { return t.state != "" }
+
+// ---------- customerRecord ----------
+
+type customerRecord struct {
+	id     int64
+	msisdn string
+	split  int
+}
+
+// ---------- main ----------
 
 func main() {
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 
 	log.Println("=== Telecom Synthetic Data Seeder ===")
-	log.Printf("Records per shard: %d | Workers: %d\n", *recordsPerShard, *workers)
+	log.Printf("Records per shard: %d | Workers: %d | Split cap: %d\n",
+		*recordsPerShard, *workers, sharding.SplitRowCap)
 
-	// Build shared MSISDN pool for cross-company duplicates (5% overlap)
 	sharedMSISDNs := generateSharedMSISDNPool(int(float64(*recordsPerShard) * 0.05))
 
 	var wg sync.WaitGroup
@@ -129,12 +169,13 @@ func main() {
 	for _, company := range sharding.Companies {
 		wg.Add(1)
 		go func(c struct {
-			Name   string
-			DBName string
-			Port   int
+			Name         string
+			DBName       string
+			Port         int
+			ShardingType sharding.ShardingType
 		}) {
 			defer wg.Done()
-			if err := seedCompany(c.Name, c.DBName, c.Port, sharedMSISDNs); err != nil {
+			if err := seedCompany(c.Name, c.DBName, c.Port, c.ShardingType, sharedMSISDNs); err != nil {
 				results <- fmt.Sprintf("[%s] FAILED: %v", c.Name, err)
 			} else {
 				results <- fmt.Sprintf("[%s] ✓ seeding complete", c.Name)
@@ -161,7 +202,9 @@ func generateSharedMSISDNPool(n int) []string {
 	return pool
 }
 
-func seedCompany(companyName, dbName string, port int, sharedMSISDNs []string) error {
+// ---------- Company-level seeding ----------
+
+func seedCompany(companyName, dbName string, port int, st sharding.ShardingType, sharedMSISDNs []string) error {
 	dsn := config.MySQLDSN(config.DBHost, port, dbName)
 	db, err := connectWithRetry(dsn, 15)
 	if err != nil {
@@ -172,18 +215,7 @@ func seedCompany(companyName, dbName string, port int, sharedMSISDNs []string) e
 	db.SetMaxOpenConns(*workers * 2)
 	db.SetMaxIdleConns(*workers)
 
-	cols := colMap[companyName]
-	plans := sourcePlanCodes[companyName]
-
-	// Build shard task list
-	var tasks []shardTask
-	for _, zone := range sharding.Zones {
-		for _, state := range zone.States {
-			for split := 1; split <= sharding.DefaultSplits; split++ {
-				tasks = append(tasks, shardTask{zone.Name, state, split})
-			}
-		}
-	}
+	tasks := buildTasks(st)
 
 	taskCh := make(chan shardTask, len(tasks))
 	for _, t := range tasks {
@@ -192,13 +224,16 @@ func seedCompany(companyName, dbName string, port int, sharedMSISDNs []string) e
 	close(taskCh)
 
 	var wg sync.WaitGroup
+	cols := colMap[companyName]
+	plans := sourcePlanCodes[companyName]
+
 	for w := 0; w < *workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for task := range taskCh {
 				if err := seedShard(db, companyName, cols, plans, task, sharedMSISDNs); err != nil {
-					log.Printf("[%s] shard %s_%s_%d error: %v", companyName, task.zone, task.state, task.split, err)
+					log.Printf("[%s] shard %s error: %v", companyName, task.key(), err)
 				}
 			}
 		}()
@@ -207,55 +242,127 @@ func seedCompany(companyName, dbName string, port int, sharedMSISDNs []string) e
 	return nil
 }
 
-func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, task shardTask, sharedPool []string) error {
-	suffix := fmt.Sprintf("%s_%s_%d", task.zone, task.state, task.split)
-
-	// Collect generated customer IDs for FK references in child tables
-	type customerRecord struct {
-		id     int64
-		msisdn string
+// buildTasks returns the shard task list for the given sharding strategy.
+func buildTasks(st sharding.ShardingType) []shardTask {
+	var tasks []shardTask
+	switch st {
+	case sharding.ZoneState:
+		for _, z := range sharding.Zones {
+			for _, state := range z.States {
+				tasks = append(tasks, shardTask{zone: z.Name, state: state})
+			}
+		}
+	case sharding.ZoneOnly:
+		for _, z := range sharding.Zones {
+			tasks = append(tasks, shardTask{zone: z.Name})
+		}
+	case sharding.StateOnly:
+		for _, state := range sharding.AllStates() {
+			tasks = append(tasks, shardTask{state: state})
+		}
 	}
-	customers := make([]customerRecord, 0, *recordsPerShard)
+	return tasks
+}
 
-	// Batch insert customers
+// ---------- Shard-level seeding ----------
+
+func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, task shardTask, sharedPool []string) error {
+	splitNum := 1
+	splitRowCount := 0
+
+	var allCustomers []customerRecord
+
 	batchSize := 100
-	var batch []string
-	var args []interface{}
-	argIdx := 1
+	type rowData struct {
+		msisdn      interface{}
+		name        string
+		dob         interface{}
+		aadhaar     string
+		pan         string
+		email       string
+		address     string
+		activatedAt string
+	}
 
-	colNames := fmt.Sprintf(
-		"(%s, %s, %s, %s, %s, %s, %s, %s, zone, state, table_split)",
-		cols.msisdn, cols.name, cols.dob, cols.aadhaar, cols.pan, cols.email, cols.address, cols.activatedAt,
-	)
+	var pending []rowData
 
-	flush := func() error {
-		if len(batch) == 0 {
+	flushCustomers := func() error {
+		if len(pending) == 0 {
 			return nil
 		}
-		query := fmt.Sprintf(
-			"INSERT INTO customers_%s %s VALUES %s",
-			suffix, colNames, strings.Join(batch, ","),
+
+		geoNames, geoPlaceholders := geoInsertParts(task)
+		colNames := fmt.Sprintf("(%s, %s, %s, %s, %s, %s, %s, %s%s, table_split)",
+			cols.msisdn, cols.name, cols.dob, cols.aadhaar, cols.pan, cols.email, cols.address, cols.activatedAt,
+			geoNames,
 		)
-		_, err := db.Exec(query, args...)
-		batch = batch[:0]
-		args = args[:0]
-		argIdx = 1
-		return err
+
+		var placeholders []string
+		var args []interface{}
+		argsPerRow := 9 + len(geoPlaceholders) // 8 data cols + table_split + geo cols
+		_ = argsPerRow
+		for _, r := range pending {
+			ph := fmt.Sprintf("(?, ?, ?, ?, ?, ?, ?, ?%s, ?)", strings.Repeat(", ?", len(geoPlaceholders)))
+			placeholders = append(placeholders, ph)
+			args = append(args, r.msisdn, r.name, r.dob, r.aadhaar, r.pan, r.email, r.address, r.activatedAt)
+			args = append(args, geoPlaceholders...)
+			args = append(args, splitNum)
+		}
+
+		query := fmt.Sprintf("INSERT INTO customers_%s %s VALUES %s",
+			task.suffix(splitNum), colNames, strings.Join(placeholders, ","))
+
+		result, err := db.Exec(query, args...)
+		if err != nil {
+			return err
+		}
+
+		firstID, err := result.LastInsertId()
+		if err != nil {
+			return err
+		}
+		for i, r := range pending {
+			var m string
+			if r.msisdn != nil {
+				m = r.msisdn.(string)
+			}
+			if m != "" {
+				allCustomers = append(allCustomers, customerRecord{
+					id:     firstID + int64(i),
+					msisdn: m,
+					split:  splitNum,
+				})
+			}
+		}
+
+		splitRowCount += len(pending)
+		pending = pending[:0]
+		return nil
 	}
 
 	for i := 0; i < *recordsPerShard; i++ {
+		// Check if we've hit the split cap — flush first, then advance split.
+		if splitRowCount >= sharding.SplitRowCap {
+			if err := flushCustomers(); err != nil {
+				return fmt.Errorf("flush before split: %w", err)
+			}
+			splitNum++
+			splitRowCount = 0
+			if err := createSplitTables(db, task.suffix(splitNum), company, cols); err != nil {
+				return fmt.Errorf("create split %d tables: %w", splitNum, err)
+			}
+			log.Printf("  shard %s: created split _%d", task.key(), splitNum)
+		}
+
 		var msisdn interface{}
-		// ~3% null MSISDNs to trigger NullHandler/Backlog
 		if rand.Float64() < 0.03 {
 			msisdn = nil
 		} else if rand.Float64() < 0.05 && len(sharedPool) > 0 {
-			// ~5% shared MSISDNs for dedup testing
 			msisdn = sharedPool[rand.Intn(len(sharedPool))]
 		} else {
 			msisdn = generateMSISDN()
 		}
 
-		// ~1% bad date (empty string simulates unparseable)
 		var dob interface{}
 		if rand.Float64() < 0.01 {
 			dob = "INVALID_DATE"
@@ -263,198 +370,427 @@ func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, 
 			dob = randomDate(1960, 2000)
 		}
 
-		aadhaar := generateAadhaar()
-		pan := generatePAN()
 		name := randomName()
-		email := fmt.Sprintf("%s@example.com", strings.ToLower(strings.ReplaceAll(name, " ", ".")))
-		address := fmt.Sprintf("%d, Sample Street, %s, India", rand.Intn(999)+1, strings.Title(task.state))
-		activatedAt := randomDate(2010, 2024)
+		pending = append(pending, rowData{
+			msisdn:      msisdn,
+			name:        name,
+			dob:         dob,
+			aadhaar:     generateAadhaar(),
+			pan:         generatePAN(),
+			email:       fmt.Sprintf("%s@example.com", strings.ToLower(strings.ReplaceAll(name, " ", "."))),
+			address:     fmt.Sprintf("%d, Sample Street, %s, India", rand.Intn(999)+1, strings.Title(task.state+task.zone)),
+			activatedAt: randomDate(2010, 2024),
+		})
 
-		ph := fmt.Sprintf("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		batch = append(batch, ph)
-		args = append(args,
-			msisdn, name, dob, aadhaar, pan, email, address, activatedAt,
-			task.zone, task.state, task.split,
-		)
-
-		if len(batch) >= batchSize {
-			if err := flush(); err != nil {
-				return fmt.Errorf("customer batch insert: %w", err)
+		if len(pending) >= batchSize {
+			if err := flushCustomers(); err != nil {
+				return fmt.Errorf("customer batch: %w", err)
 			}
 		}
 	}
-	if err := flush(); err != nil {
+	if err := flushCustomers(); err != nil {
 		return err
 	}
 
-	// Fetch inserted IDs + MSISDNs for FK use
-	rows, err := db.Query(fmt.Sprintf(
-		"SELECT id, %s FROM customers_%s WHERE zone=? AND state=? AND table_split=? AND %s IS NOT NULL LIMIT ?",
-		cols.msisdn, suffix, cols.msisdn,
-	), task.zone, task.state, task.split, *recordsPerShard)
-	if err != nil {
-		return fmt.Errorf("fetch customers: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
-		var m string
-		if err := rows.Scan(&id, &m); err != nil {
-			continue
-		}
-		customers = append(customers, customerRecord{id, m})
-	}
-
-	if len(customers) == 0 {
+	if len(allCustomers) == 0 {
 		return nil
 	}
 
-	// Seed child tables
-	if err := seedSubscriptions(db, suffix, company, cols, plans, customers, task); err != nil {
-		return fmt.Errorf("subscriptions: %w", err)
+	// Group customers by split so child tables land in the matching split table.
+	bySplit := map[int][]customerRecord{}
+	for _, c := range allCustomers {
+		bySplit[c.split] = append(bySplit[c.split], c)
 	}
-	if err := seedBillingAccounts(db, suffix, cols, customers, task); err != nil {
-		return fmt.Errorf("billing: %w", err)
-	}
-	if err := seedSimInventory(db, suffix, cols, customers, task); err != nil {
-		return fmt.Errorf("sim_inventory: %w", err)
-	}
-	if err := seedPortHistory(db, suffix, cols, customers, task); err != nil {
-		return fmt.Errorf("port_history: %w", err)
+
+	for split, splitCustomers := range bySplit {
+		suffix := task.suffix(split)
+		if err := seedSubscriptions(db, suffix, cols, plans, splitCustomers, task); err != nil {
+			return fmt.Errorf("subscriptions split %d: %w", split, err)
+		}
+		if err := seedBillingAccounts(db, suffix, cols, splitCustomers, task); err != nil {
+			return fmt.Errorf("billing split %d: %w", split, err)
+		}
+		if err := seedSimInventory(db, suffix, cols, splitCustomers, task); err != nil {
+			return fmt.Errorf("sim_inventory split %d: %w", split, err)
+		}
+		if err := seedPortHistory(db, suffix, cols, splitCustomers, task); err != nil {
+			return fmt.Errorf("port_history split %d: %w", split, err)
+		}
 	}
 
 	return nil
 }
 
-func seedSubscriptions(db *sql.DB, suffix, company string, cols companyColumns, plans []string, customers []struct {
-	id     int64
-	msisdn string
-}, task shardTask) error {
+// geoInsertParts returns the column name fragment and value slice for zone/state geo columns.
+// Column names come back as ", zone, state" (or subset); values come back as interface{} slice.
+func geoInsertParts(task shardTask) (colFragment string, values []interface{}) {
+	if task.hasZone() {
+		colFragment += ", zone"
+		values = append(values, task.zone)
+	}
+	if task.hasState() {
+		colFragment += ", state"
+		values = append(values, task.state)
+	}
+	return colFragment, values
+}
+
+// ---------- Child table seeders ----------
+
+func seedSubscriptions(db *sql.DB, suffix string, cols companyColumns, plans []string, customers []customerRecord, task shardTask) error {
+	statuses := []string{"ACTIVE", "INACTIVE", "SUSPENDED", "EXPIRED"}
+	geoNames, geoVals := geoInsertParts(task)
+
 	var rows []string
 	var args []interface{}
-	statuses := []string{"ACTIVE", "INACTIVE", "SUSPENDED", "EXPIRED"}
-
 	for _, c := range customers {
-		// ~2% invalid plan codes to trigger PlanMapper backlog
 		var planCode string
 		if rand.Float64() < 0.02 {
-			planCode = "INVALID_PLAN_" + fmt.Sprintf("%04d", rand.Intn(9999))
+			planCode = fmt.Sprintf("INVALID_PLAN_%04d", rand.Intn(9999))
 		} else {
 			planCode = plans[rand.Intn(len(plans))]
 		}
 
-		start := randomDate(2020, 2024)
-		end := randomDate(2024, 2026)
-		status := statuses[rand.Intn(len(statuses))]
-
-		rows = append(rows, "(?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args, c.id, c.msisdn, planCode, start, end, status, task.zone, task.state, task.split)
+		ph := fmt.Sprintf("(?, ?, ?, ?, ?, ?%s, ?)", strings.Repeat(", ?", len(geoVals)))
+		rows = append(rows, ph)
+		args = append(args, c.id, c.msisdn, planCode, randomDate(2020, 2024), randomDate(2024, 2026),
+			statuses[rand.Intn(len(statuses))])
+		args = append(args, geoVals...)
+		args = append(args, c.split)
 	}
 
-	return batchInsert(db,
-		fmt.Sprintf("INSERT INTO subscriptions_%s (customer_id, %s, %s, %s, %s, %s, zone, state, table_split) VALUES ",
-			suffix, cols.msisdn, cols.planCode, cols.planStart, cols.planEnd, cols.subStatus),
-		rows, args, 200)
+	prefix := fmt.Sprintf(
+		"INSERT INTO subscriptions_%s (customer_id, %s, %s, %s, %s, %s%s, table_split) VALUES ",
+		suffix, cols.msisdn, cols.planCode, cols.planStart, cols.planEnd, cols.subStatus, geoNames,
+	)
+	return batchInsert(db, prefix, rows, args, 200)
 }
 
-func seedBillingAccounts(db *sql.DB, suffix string, cols companyColumns, customers []struct {
-	id     int64
-	msisdn string
-}, task shardTask) error {
+func seedBillingAccounts(db *sql.DB, suffix string, cols companyColumns, customers []customerRecord, task shardTask) error {
+	billStatuses := []string{"PAID", "UNPAID", "PARTIALLY_PAID", "OVERDUE"}
+	geoNames, geoVals := geoInsertParts(task)
+
 	var rows []string
 	var args []interface{}
-	billStatuses := []string{"PAID", "UNPAID", "PARTIALLY_PAID", "OVERDUE"}
-
 	for _, c := range customers {
 		due := float64(rand.Intn(2000)) + rand.Float64()
 		paid := due * rand.Float64()
-		cycleStart := randomDate(2024, 2025)
-		cycleEnd := randomDate(2025, 2026)
-		status := billStatuses[rand.Intn(len(billStatuses))]
 
-		rows = append(rows, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		ph := fmt.Sprintf("(?, ?, ?, ?, ?, ?, ?%s, ?)", strings.Repeat(", ?", len(geoVals)))
+		rows = append(rows, ph)
 		args = append(args, c.id, c.msisdn,
 			fmt.Sprintf("%.2f", due), fmt.Sprintf("%.2f", paid),
-			cycleStart, cycleEnd, status, task.zone, task.state, task.split)
+			randomDate(2024, 2025), randomDate(2025, 2026),
+			billStatuses[rand.Intn(len(billStatuses))])
+		args = append(args, geoVals...)
+		args = append(args, c.split)
 	}
 
-	return batchInsert(db,
-		fmt.Sprintf("INSERT INTO billing_accounts_%s (customer_id, %s, %s, %s, %s, %s, bill_status, zone, state, table_split) VALUES ",
-			suffix, cols.msisdn, cols.dueAmount, cols.paidAmount, cols.cycleStart, cols.cycleEnd),
-		rows, args, 200)
+	prefix := fmt.Sprintf(
+		"INSERT INTO billing_accounts_%s (customer_id, %s, %s, %s, %s, %s, bill_status%s, table_split) VALUES ",
+		suffix, cols.msisdn, cols.dueAmount, cols.paidAmount, cols.cycleStart, cols.cycleEnd, geoNames,
+	)
+	return batchInsert(db, prefix, rows, args, 200)
 }
 
-func seedSimInventory(db *sql.DB, suffix string, cols companyColumns, customers []struct {
-	id     int64
-	msisdn string
-}, task shardTask) error {
-	var rows []string
-	var args []interface{}
+func seedSimInventory(db *sql.DB, suffix string, cols companyColumns, customers []customerRecord, task shardTask) error {
 	simStatuses := []string{"ACTIVE", "INACTIVE", "BLOCKED", "LOST"}
+	geoNames, geoVals := geoInsertParts(task)
 
-	for _, c := range customers {
-		simSerial := fmt.Sprintf("89910%015d", rand.Int63n(1e15))
-		imsi := fmt.Sprintf("4040%011d", rand.Int63n(1e11))
-		status := simStatuses[rand.Intn(len(simStatuses))]
-		activatedDate := randomDate(2015, 2024)
-
-		rows = append(rows, "(?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args, c.id, c.msisdn, simSerial, imsi, status, activatedDate, task.zone, task.state, task.split)
-	}
-
-	return batchInsert(db,
-		fmt.Sprintf("INSERT INTO sim_inventory_%s (customer_id, %s, %s, %s, %s, activated_date, zone, state, table_split) VALUES ",
-			suffix, cols.msisdn, cols.simSerial, cols.imsi, cols.simStatus),
-		rows, args, 200)
-}
-
-func seedPortHistory(db *sql.DB, suffix string, cols companyColumns, customers []struct {
-	id     int64
-	msisdn string
-}, task shardTask) error {
-	// Only ~20% of customers have porting history
 	var rows []string
 	var args []interface{}
-	directions := []string{"IN", "OUT"}
+	for _, c := range customers {
+		ph := fmt.Sprintf("(?, ?, ?, ?, ?, ?%s, ?)", strings.Repeat(", ?", len(geoVals)))
+		rows = append(rows, ph)
+		args = append(args, c.id, c.msisdn,
+			fmt.Sprintf("89910%015d", rand.Int63n(1e15)),
+			fmt.Sprintf("4040%011d", rand.Int63n(1e11)),
+			simStatuses[rand.Intn(len(simStatuses))],
+			randomDate(2015, 2024))
+		args = append(args, geoVals...)
+		args = append(args, c.split)
+	}
 
+	prefix := fmt.Sprintf(
+		"INSERT INTO sim_inventory_%s (customer_id, %s, %s, %s, %s, activated_date%s, table_split) VALUES ",
+		suffix, cols.msisdn, cols.simSerial, cols.imsi, cols.simStatus, geoNames,
+	)
+	return batchInsert(db, prefix, rows, args, 200)
+}
+
+func seedPortHistory(db *sql.DB, suffix string, cols companyColumns, customers []customerRecord, task shardTask) error {
+	directions := []string{"IN", "OUT"}
+	geoNames, geoVals := geoInsertParts(task)
+
+	var rows []string
+	var args []interface{}
 	for _, c := range customers {
 		if rand.Float64() > 0.20 {
 			continue
 		}
-		dir := directions[rand.Intn(2)]
-		from := carriers[rand.Intn(len(carriers))]
-		to := carriers[rand.Intn(len(carriers))]
-		portDate := randomDate(2018, 2024)
-		ref := fmt.Sprintf("UPC%08d", rand.Intn(1e8))
-
-		rows = append(rows, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args, c.id, c.msisdn, dir, from, to, portDate, ref, task.zone, task.state, task.split)
+		ph := fmt.Sprintf("(?, ?, ?, ?, ?, ?, ?%s, ?)", strings.Repeat(", ?", len(geoVals)))
+		rows = append(rows, ph)
+		args = append(args, c.id, c.msisdn,
+			directions[rand.Intn(2)],
+			carriers[rand.Intn(len(carriers))],
+			carriers[rand.Intn(len(carriers))],
+			randomDate(2018, 2024),
+			fmt.Sprintf("UPC%08d", rand.Intn(1e8)))
+		args = append(args, geoVals...)
+		args = append(args, c.split)
 	}
 
 	if len(rows) == 0 {
 		return nil
 	}
-	return batchInsert(db,
-		fmt.Sprintf("INSERT INTO port_history_%s (customer_id, %s, %s, %s, %s, port_date, porting_ref, zone, state, table_split) VALUES ",
-			suffix, cols.msisdn, cols.portType, cols.fromCarrier, cols.toCarrier),
-		rows, args, 200)
+	prefix := fmt.Sprintf(
+		"INSERT INTO port_history_%s (customer_id, %s, %s, %s, %s, port_date, porting_ref%s, table_split) VALUES ",
+		suffix, cols.msisdn, cols.portType, cols.fromCarrier, cols.toCarrier, geoNames,
+	)
+	return batchInsert(db, prefix, rows, args, 200)
+}
+
+// ---------- Dynamic split table creation ----------
+
+// createSplitTables creates all 5 table types for a new split suffix.
+// Called by the seeder when SplitRowCap is reached; mirrors the DDL in mysql_schema.
+func createSplitTables(db *sql.DB, suffix, company string, cols companyColumns) error {
+	s := toDDLSchema(cols)
+	hasZone := true  // determined by which cols are non-empty; approximated by company
+	hasState := true // both are safe defaults — columns are present when geo args are supplied
+
+	// Derive from column presence: zone-only companies (idea) have no state-specific cols,
+	// but since companyColumns doesn't carry geo metadata, we use the suffix as a signal.
+	// Suffixes for zone-only look like "north_2" (one word before the split digit).
+	// Suffixes for state-only look like "up_2". Zone+state look like "north_up_2".
+	parts := strings.Split(suffix, "_")
+	// last part is the split number; remaining parts are the geo key
+	geoKey := strings.Join(parts[:len(parts)-1], "_")
+	zoneParts := 0
+	for _, z := range sharding.Zones {
+		if z.Name == geoKey {
+			zoneParts = 1 // zone-only
+			break
+		}
+		for _, st := range z.States {
+			if st == geoKey {
+				zoneParts = -1 // state-only
+				break
+			}
+		}
+		if zoneParts != 0 {
+			break
+		}
+	}
+	switch zoneParts {
+	case 1:
+		hasZone, hasState = true, false
+	case -1:
+		hasZone, hasState = false, true
+	default:
+		hasZone, hasState = true, true // zone_state
+	}
+
+	ddls := []string{
+		customersDDL(suffix, s, hasZone, hasState),
+		subscriptionsDDL(suffix, s, hasZone, hasState),
+		billingAccountsDDL(suffix, s, hasZone, hasState),
+		simInventoryDDL(suffix, s, hasZone, hasState),
+		portHistoryDDL(suffix, s, hasZone, hasState),
+	}
+	for _, ddl := range ddls {
+		if _, err := db.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ddlSchema mirrors mysql_schema's companySchema but sourced from companyColumns.
+type ddlSchema struct {
+	msisdn, name, dob, aadhaar, pan, email, address, activatedAt string
+	planCode, planStart, planEnd, status                          string
+	dueAmount, paidAmount, cycleStart, cycleEnd                   string
+	simSerial, imsi, simStatus                                    string
+	portType, fromCarrier, toCarrier                              string
+}
+
+func toDDLSchema(c companyColumns) ddlSchema {
+	return ddlSchema{
+		msisdn: c.msisdn, name: c.name, dob: c.dob, aadhaar: c.aadhaar, pan: c.pan,
+		email: c.email, address: c.address, activatedAt: c.activatedAt,
+		planCode: c.planCode, planStart: c.planStart, planEnd: c.planEnd, status: c.subStatus,
+		dueAmount: c.dueAmount, paidAmount: c.paidAmount, cycleStart: c.cycleStart, cycleEnd: c.cycleEnd,
+		simSerial: c.simSerial, imsi: c.imsi, simStatus: c.simStatus,
+		portType: c.portType, fromCarrier: c.fromCarrier, toCarrier: c.toCarrier,
+	}
+}
+
+func geoColsDDL(hasZone, hasState bool) string {
+	switch {
+	case hasZone && hasState:
+		return "zone            VARCHAR(20)  NOT NULL,\n    state           VARCHAR(50)  NOT NULL,"
+	case hasZone:
+		return "zone            VARCHAR(20)  NOT NULL,"
+	case hasState:
+		return "state           VARCHAR(50)  NOT NULL,"
+	default:
+		return ""
+	}
+}
+
+func geoIdxDDL(hasZone, hasState bool) string {
+	switch {
+	case hasZone && hasState:
+		return "INDEX idx_zone_state (zone, state)"
+	case hasZone:
+		return "INDEX idx_zone (zone)"
+	case hasState:
+		return "INDEX idx_state (state)"
+	default:
+		return ""
+	}
+}
+
+func customersDDL(suffix string, s ddlSchema, hasZone, hasState bool) string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS customers_%s (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    %s              VARCHAR(15)  COMMENT 'msisdn',
+    %s              VARCHAR(100) NOT NULL COMMENT 'name',
+    %s              DATE         COMMENT 'dob',
+    %s              VARCHAR(20)  COMMENT 'aadhaar',
+    %s              VARCHAR(15)  COMMENT 'pan',
+    %s              VARCHAR(150) COMMENT 'email',
+    %s              TEXT         COMMENT 'address',
+    %s              DATETIME     COMMENT 'activation_date',
+    %s
+    table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_msisdn (%s),
+    %s
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		suffix,
+		s.msisdn, s.name, s.dob, s.aadhaar, s.pan, s.email, s.address, s.activatedAt,
+		geoColsDDL(hasZone, hasState),
+		s.msisdn,
+		geoIdxDDL(hasZone, hasState),
+	)
+}
+
+func subscriptionsDDL(suffix string, s ddlSchema, hasZone, hasState bool) string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS subscriptions_%s (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    customer_id     BIGINT UNSIGNED NOT NULL,
+    %s              VARCHAR(15)  NOT NULL COMMENT 'msisdn',
+    %s              VARCHAR(50)  NOT NULL COMMENT 'plan_code',
+    %s              DATE         COMMENT 'plan_start',
+    %s              DATE         COMMENT 'plan_end',
+    %s              VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
+    %s
+    table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_msisdn (%s),
+    INDEX idx_plan (%s)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		suffix,
+		s.msisdn, s.planCode, s.planStart, s.planEnd, s.status,
+		geoColsDDL(hasZone, hasState),
+		s.msisdn, s.planCode,
+	)
+}
+
+func billingAccountsDDL(suffix string, s ddlSchema, hasZone, hasState bool) string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS billing_accounts_%s (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    customer_id     BIGINT UNSIGNED NOT NULL,
+    %s              VARCHAR(15)  NOT NULL COMMENT 'msisdn',
+    %s              DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    %s              DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    %s              DATE         COMMENT 'cycle_start',
+    %s              DATE         COMMENT 'cycle_end',
+    bill_status     VARCHAR(20)  NOT NULL DEFAULT 'UNPAID',
+    %s
+    table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_msisdn (%s),
+    INDEX idx_cycle (%s, %s)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		suffix,
+		s.msisdn, s.dueAmount, s.paidAmount, s.cycleStart, s.cycleEnd,
+		geoColsDDL(hasZone, hasState),
+		s.msisdn, s.cycleStart, s.cycleEnd,
+	)
+}
+
+func simInventoryDDL(suffix string, s ddlSchema, hasZone, hasState bool) string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS sim_inventory_%s (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    customer_id     BIGINT UNSIGNED NOT NULL,
+    %s              VARCHAR(15)  NOT NULL COMMENT 'msisdn',
+    %s              VARCHAR(22)  NOT NULL COMMENT 'sim_serial',
+    %s              VARCHAR(15)  NOT NULL COMMENT 'imsi',
+    %s              VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
+    activated_date  DATE         COMMENT 'sim activation date',
+    deactivated_date DATE,
+    %s
+    table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_msisdn (%s),
+    UNIQUE idx_iccid (%s)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		suffix,
+		s.msisdn, s.simSerial, s.imsi, s.simStatus,
+		geoColsDDL(hasZone, hasState),
+		s.msisdn, s.simSerial,
+	)
+}
+
+func portHistoryDDL(suffix string, s ddlSchema, hasZone, hasState bool) string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS port_history_%s (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    customer_id     BIGINT UNSIGNED NOT NULL,
+    %s              VARCHAR(15)  NOT NULL COMMENT 'msisdn',
+    %s              VARCHAR(10)  NOT NULL COMMENT 'port direction',
+    %s              VARCHAR(50)  COMMENT 'from_carrier',
+    %s              VARCHAR(50)  COMMENT 'to_carrier',
+    port_date       DATE         NOT NULL,
+    porting_ref     VARCHAR(30),
+    status          VARCHAR(20)  NOT NULL DEFAULT 'COMPLETED',
+    %s
+    table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_msisdn (%s),
+    INDEX idx_port_date (port_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		suffix,
+		s.msisdn, s.portType, s.fromCarrier, s.toCarrier,
+		geoColsDDL(hasZone, hasState),
+		s.msisdn,
+	)
 }
 
 // ---------- Helpers ----------
 
 func batchInsert(db *sql.DB, prefix string, rows []string, args []interface{}, batchSize int) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	argsPerRow := len(args) / len(rows)
 	for start := 0; start < len(rows); start += batchSize {
 		end := start + batchSize
 		if end > len(rows) {
 			end = len(rows)
 		}
-		chunkRows := rows[start:end]
-		chunkArgs := args[start*len(args)/len(rows) : end*len(args)/len(rows)]
-		// Approximate arg split — use exact calculation
-		argsPerRow := len(args) / len(rows)
-		chunkArgs = args[start*argsPerRow : end*argsPerRow]
-
-		query := prefix + strings.Join(chunkRows, ",")
+		chunkArgs := args[start*argsPerRow : end*argsPerRow]
+		query := prefix + strings.Join(rows[start:end], ",")
 		if _, err := db.Exec(query, chunkArgs...); err != nil {
 			return err
 		}
@@ -477,10 +813,8 @@ func connectWithRetry(dsn string, retries int) (*sql.DB, error) {
 }
 
 func generateMSISDN() string {
-	// Indian mobile numbers: 10 digits starting with 6-9
 	prefixes := []string{"6", "7", "8", "9"}
-	prefix := prefixes[rand.Intn(len(prefixes))]
-	return "9" + prefix + fmt.Sprintf("%08d", rand.Intn(1e8))
+	return "9" + prefixes[rand.Intn(len(prefixes))] + fmt.Sprintf("%08d", rand.Intn(1e8))
 }
 
 func generateAadhaar() string {

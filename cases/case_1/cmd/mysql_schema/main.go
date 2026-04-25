@@ -1,17 +1,19 @@
-// mysql_schema — creates all sharded source tables on the 4 MySQL Docker instances.
+// mysql_schema — creates the initial sharded source tables on the 4 MySQL Docker instances.
 //
 // Usage:
 //   go run ./cmd/mysql_schema
 //
-// Connects to each MySQL container (ports 3306-3309) and creates:
-//   customers_{zone}_{state}_{n}
-//   subscriptions_{zone}_{state}_{n}
-//   billing_accounts_{zone}_{state}_{n}
-//   sim_inventory_{zone}_{state}_{n}
-//   port_history_{zone}_{state}_{n}
+// Only split _1 is created here. The seeder dynamically creates _2, _3 … when a
+// table grows past sharding.SplitRowCap (1 million rows).
 //
-// Each company uses deliberately different column naming to simulate real-world
-// schema divergence (the SchemaMapper transformer handles normalization).
+// Sharding strategy differs per company (simulating real-world divergence):
+//   vodafone  — zone + state  → customers_north_up_1
+//   idea      — zone only     → customers_north_1
+//   tata_docomo — state only  → customers_up_1
+//   aircel    — zone + state  → customers_north_up_1
+//
+// Tables for zone-only companies omit the `state` column; state-only companies
+// omit the `zone` column. This exercises the SchemaMapper / GeoTagger transformers.
 
 package main
 
@@ -19,7 +21,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -30,8 +31,7 @@ import (
 
 // companySchema defines how each company names its columns (intentional divergence).
 type companySchema struct {
-	// customers table column variants
-	msisdnCol   string // phone number column name
+	msisdnCol   string
 	nameCol     string
 	dobCol      string
 	aadhaarCol  string
@@ -40,30 +40,25 @@ type companySchema struct {
 	addressCol  string
 	activatedAt string
 
-	// subscriptions
 	planCodeCol string
 	startCol    string
 	endCol      string
 	statusCol   string
 
-	// billing
 	dueAmountCol  string
 	paidAmountCol string
 	cycleStartCol string
 	cycleEndCol   string
 
-	// sim_inventory
 	simSerialCol string
 	imsiCol      string
 	simStatusCol string
 
-	// port_history
-	portTypeCol string  // IN or OUT
+	portTypeCol string
 	fromCarrier string
 	toCarrier   string
 }
 
-// companySchemas maps company name → its column naming quirks.
 var companySchemas = map[string]companySchema{
 	"vodafone": {
 		msisdnCol: "mob_no", nameCol: "cust_name", dobCol: "date_of_birth",
@@ -105,81 +100,123 @@ var companySchemas = map[string]companySchema{
 
 func main() {
 	log.Println("=== MySQL Schema Creator ===")
-	log.Printf("Creating sharded tables across %d companies\n", len(sharding.Companies))
 
 	for _, company := range sharding.Companies {
 		dsn := config.MySQLDSN(config.DBHost, company.Port, company.DBName)
-		log.Printf("[%s] Connecting on port %d ...", company.Name, company.Port)
+		log.Printf("[%s] connecting on port %d (sharding: %s) ...", company.Name, company.Port, company.ShardingType)
 
 		db, err := connectWithRetry(dsn, 15)
 		if err != nil {
-			log.Fatalf("[%s] Failed to connect: %v", company.Name, err)
+			log.Fatalf("[%s] failed to connect: %v", company.Name, err)
 		}
 		defer db.Close()
 
-		schema := companySchemas[company.Name]
-		if err := createAllShardedTables(db, company.Name, schema); err != nil {
-			log.Fatalf("[%s] Schema creation failed: %v", company.Name, err)
+		s := companySchemas[company.Name]
+		n, err := createInitialSplits(db, company.Name, company.ShardingType, s)
+		if err != nil {
+			log.Fatalf("[%s] schema creation failed: %v", company.Name, err)
 		}
-		log.Printf("[%s] ✓ All tables created\n", company.Name)
+		log.Printf("[%s] ✓ %d tables created (split _1 only; seeder creates _2+ dynamically)\n", company.Name, n)
 	}
 
 	log.Println("=== MySQL schema setup complete ===")
 }
 
-// connectWithRetry retries the MySQL connection (containers may take time to be ready).
-func connectWithRetry(dsn string, retries int) (*sql.DB, error) {
-	var db *sql.DB
-	var err error
-	for i := 0; i < retries; i++ {
-		db, err = sql.Open("mysql", dsn)
-		if err == nil {
-			if pingErr := db.Ping(); pingErr == nil {
-				return db, nil
+// createInitialSplits creates only the _1 split for each shard.
+// Subsequent splits are created on the fly by the seeder when SplitRowCap is reached.
+func createInitialSplits(db *sql.DB, company string, st sharding.ShardingType, s companySchema) (int, error) {
+	var suffixes []suffixMeta
+
+	switch st {
+	case sharding.ZoneState:
+		for _, z := range sharding.Zones {
+			for _, state := range z.States {
+				suffixes = append(suffixes, suffixMeta{
+					suffix:   fmt.Sprintf("%s_%s_1", z.Name, state),
+					hasZone:  true,
+					hasState: true,
+				})
 			}
 		}
-		log.Printf("  waiting for DB... (%d/%d)", i+1, retries)
-		time.Sleep(3 * time.Second)
-	}
-	return nil, fmt.Errorf("could not connect after %d retries: %v", retries, err)
-}
-
-// createAllShardedTables iterates every zone → state → split and creates all 5 table types.
-func createAllShardedTables(db *sql.DB, company string, s companySchema) error {
-	totalTables := 0
-	for _, zone := range sharding.Zones {
-		for _, state := range zone.States {
-			for split := 1; split <= sharding.DefaultSplits; split++ {
-				suffix := fmt.Sprintf("%s_%s_%d", zone.Name, state, split)
-
-				ddls := []string{
-					customersTable(suffix, s),
-					subscriptionsTable(suffix, s),
-					billingAccountsTable(suffix, s),
-					simInventoryTable(suffix, s),
-					portHistoryTable(suffix, s),
-				}
-
-				for _, ddl := range ddls {
-					if _, err := db.Exec(ddl); err != nil {
-						return fmt.Errorf("zone=%s state=%s split=%d: %w", zone.Name, state, split, err)
-					}
-					totalTables++
-				}
-			}
+	case sharding.ZoneOnly:
+		for _, z := range sharding.Zones {
+			suffixes = append(suffixes, suffixMeta{
+				suffix:   fmt.Sprintf("%s_1", z.Name),
+				hasZone:  true,
+				hasState: false,
+			})
+		}
+	case sharding.StateOnly:
+		for _, state := range sharding.AllStates() {
+			suffixes = append(suffixes, suffixMeta{
+				suffix:   fmt.Sprintf("%s_1", state),
+				hasZone:  false,
+				hasState: true,
+			})
 		}
 	}
-	log.Printf("  created %d tables", totalTables)
-	return nil
+
+	count := 0
+	for _, sm := range suffixes {
+		ddls := buildDDLs(sm.suffix, s, sm.hasZone, sm.hasState)
+		for _, ddl := range ddls {
+			if _, err := db.Exec(ddl); err != nil {
+				return count, fmt.Errorf("suffix=%s: %w", sm.suffix, err)
+			}
+			count++
+		}
+	}
+	return count, nil
 }
 
-// ---------- DDL builders ----------
+type suffixMeta struct {
+	suffix   string
+	hasZone  bool
+	hasState bool
+}
 
-func customersTable(suffix string, s companySchema) string {
+func buildDDLs(suffix string, s companySchema, hasZone, hasState bool) []string {
+	return []string{
+		customersTable(suffix, s, hasZone, hasState),
+		subscriptionsTable(suffix, s, hasZone, hasState),
+		billingAccountsTable(suffix, s, hasZone, hasState),
+		simInventoryTable(suffix, s, hasZone, hasState),
+		portHistoryTable(suffix, s, hasZone, hasState),
+	}
+}
+
+// geoColsDDL returns the zone/state column definitions appropriate for this company's sharding type.
+func geoColsDDL(hasZone, hasState bool) string {
+	switch {
+	case hasZone && hasState:
+		return "zone            VARCHAR(20)  NOT NULL,\n    state           VARCHAR(50)  NOT NULL,"
+	case hasZone:
+		return "zone            VARCHAR(20)  NOT NULL,"
+	case hasState:
+		return "state           VARCHAR(50)  NOT NULL,"
+	default:
+		return ""
+	}
+}
+
+func geoIdxDDL(hasZone, hasState bool) string {
+	switch {
+	case hasZone && hasState:
+		return "INDEX idx_zone_state (zone, state)"
+	case hasZone:
+		return "INDEX idx_zone (zone)"
+	case hasState:
+		return "INDEX idx_state (state)"
+	default:
+		return ""
+	}
+}
+
+func customersTable(suffix string, s companySchema, hasZone, hasState bool) string {
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS customers_%s (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    %s              VARCHAR(15)  NOT NULL COMMENT 'msisdn',
+    %s              VARCHAR(15)  COMMENT 'msisdn',
     %s              VARCHAR(100) NOT NULL COMMENT 'name',
     %s              DATE         COMMENT 'dob',
     %s              VARCHAR(20)  COMMENT 'aadhaar (raw, pre-mask)',
@@ -187,21 +224,22 @@ CREATE TABLE IF NOT EXISTS customers_%s (
     %s              VARCHAR(150) COMMENT 'email',
     %s              TEXT         COMMENT 'address',
     %s              DATETIME     COMMENT 'activation_date',
-    zone            VARCHAR(20)  NOT NULL,
-    state           VARCHAR(50)  NOT NULL,
+    %s
     table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
     created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_msisdn (%s),
-    INDEX idx_zone_state (zone, state)
+    %s
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		suffix,
 		s.msisdnCol, s.nameCol, s.dobCol, s.aadhaarCol, s.panCol, s.emailCol, s.addressCol, s.activatedAt,
+		geoColsDDL(hasZone, hasState),
 		s.msisdnCol,
+		geoIdxDDL(hasZone, hasState),
 	)
 }
 
-func subscriptionsTable(suffix string, s companySchema) string {
+func subscriptionsTable(suffix string, s companySchema, hasZone, hasState bool) string {
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS subscriptions_%s (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -211,8 +249,7 @@ CREATE TABLE IF NOT EXISTS subscriptions_%s (
     %s              DATE         COMMENT 'plan_start',
     %s              DATE         COMMENT 'plan_end',
     %s              VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE' COMMENT 'status',
-    zone            VARCHAR(20)  NOT NULL,
-    state           VARCHAR(50)  NOT NULL,
+    %s
     table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
     created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -221,11 +258,12 @@ CREATE TABLE IF NOT EXISTS subscriptions_%s (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		suffix,
 		s.msisdnCol, s.planCodeCol, s.startCol, s.endCol, s.statusCol,
+		geoColsDDL(hasZone, hasState),
 		s.msisdnCol, s.planCodeCol,
 	)
 }
 
-func billingAccountsTable(suffix string, s companySchema) string {
+func billingAccountsTable(suffix string, s companySchema, hasZone, hasState bool) string {
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS billing_accounts_%s (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -236,8 +274,7 @@ CREATE TABLE IF NOT EXISTS billing_accounts_%s (
     %s              DATE         COMMENT 'cycle_start',
     %s              DATE         COMMENT 'cycle_end',
     bill_status     VARCHAR(20)  NOT NULL DEFAULT 'UNPAID',
-    zone            VARCHAR(20)  NOT NULL,
-    state           VARCHAR(50)  NOT NULL,
+    %s
     table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
     created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -246,11 +283,12 @@ CREATE TABLE IF NOT EXISTS billing_accounts_%s (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		suffix,
 		s.msisdnCol, s.dueAmountCol, s.paidAmountCol, s.cycleStartCol, s.cycleEndCol,
+		geoColsDDL(hasZone, hasState),
 		s.msisdnCol, s.cycleStartCol, s.cycleEndCol,
 	)
 }
 
-func simInventoryTable(suffix string, s companySchema) string {
+func simInventoryTable(suffix string, s companySchema, hasZone, hasState bool) string {
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS sim_inventory_%s (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -261,8 +299,7 @@ CREATE TABLE IF NOT EXISTS sim_inventory_%s (
     %s              VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE' COMMENT 'sim_status',
     activated_date  DATE         COMMENT 'sim activation date',
     deactivated_date DATE        COMMENT 'sim deactivation date (nullable)',
-    zone            VARCHAR(20)  NOT NULL,
-    state           VARCHAR(50)  NOT NULL,
+    %s
     table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
     created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_msisdn (%s),
@@ -270,11 +307,12 @@ CREATE TABLE IF NOT EXISTS sim_inventory_%s (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		suffix,
 		s.msisdnCol, s.simSerialCol, s.imsiCol, s.simStatusCol,
+		geoColsDDL(hasZone, hasState),
 		s.msisdnCol, s.simSerialCol,
 	)
 }
 
-func portHistoryTable(suffix string, s companySchema) string {
+func portHistoryTable(suffix string, s companySchema, hasZone, hasState bool) string {
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS port_history_%s (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -286,8 +324,7 @@ CREATE TABLE IF NOT EXISTS port_history_%s (
     port_date       DATE         NOT NULL,
     porting_ref     VARCHAR(30)  COMMENT 'UPC / porting reference number',
     status          VARCHAR(20)  NOT NULL DEFAULT 'COMPLETED',
-    zone            VARCHAR(20)  NOT NULL,
-    state           VARCHAR(50)  NOT NULL,
+    %s
     table_split     TINYINT UNSIGNED NOT NULL DEFAULT 1,
     created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_msisdn (%s),
@@ -295,15 +332,21 @@ CREATE TABLE IF NOT EXISTS port_history_%s (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		suffix,
 		s.msisdnCol, s.portTypeCol, s.fromCarrier, s.toCarrier,
+		geoColsDDL(hasZone, hasState),
 		s.msisdnCol,
 	)
 }
 
-// splitName returns a formatted table name like "customers_north_up_1"
-func splitName(tableType, zone, state string, split int) string {
-	return fmt.Sprintf("%s_%s_%s_%d", tableType, zone, state, split)
+func connectWithRetry(dsn string, retries int) (*sql.DB, error) {
+	for i := 0; i < retries; i++ {
+		db, err := sql.Open("mysql", dsn)
+		if err == nil {
+			if pingErr := db.Ping(); pingErr == nil {
+				return db, nil
+			}
+		}
+		log.Printf("  waiting for DB... (%d/%d)", i+1, retries)
+		time.Sleep(3 * time.Second)
+	}
+	return nil, fmt.Errorf("could not connect after %d retries", retries)
 }
-
-// ensure splitName is referenced to avoid unused import lint
-var _ = strings.ToUpper
-var _ = splitName
