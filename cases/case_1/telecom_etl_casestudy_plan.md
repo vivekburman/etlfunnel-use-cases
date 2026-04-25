@@ -1,0 +1,425 @@
+# Telecom Customer Merger — ETL Pipeline Case Study Plan
+### MySQL (Multi-Source) → PostgreSQL (Destination) | Streamcraft Execution Framework
+
+---
+
+## Overview
+
+This case study models a real-world telecom consolidation where four acquired companies — **Vodafone, Idea, Tata Docomo, Aircel** — each with their own MySQL databases, are migrated into a unified destination Postgres database (Airtel / Jio or both). The pipeline is built on top of the Streamcraft Execution framework and is designed to demonstrate every major ETL scenario at enterprise scale.
+
+---
+
+## Part 1 — Source Architecture (MySQL)
+
+### 1.1 Source Databases
+- 4 independent MySQL instances, one per company:
+  - `vodafone_db`
+  - `idea_db`
+  - `tata_docomo_db`
+  - `aircel_db`
+- Each DB has its own schema, column naming conventions, data types, and quirks.
+
+### 1.2 Sharding Strategy — Two-Tier Geographic Distribution
+
+**Tier 1 — Zone-based sharding (5 zones):**
+- North, South, East, West, Central
+
+**Tier 2 — State-based sharding within each zone:**
+- North: UP, Bihar, Jharkhand, HP, Uttarakhand, Punjab, Haryana, J&K, Delhi
+- South: Tamil Nadu, Kerala, Karnataka, Andhra Pradesh, Telangana
+- East: West Bengal, Odisha, Assam, Meghalaya, Tripura, Sikkim
+- West: Maharashtra, Gujarat, Rajasthan, Goa
+- Central: MP, Chhattisgarh
+
+**Tier 3 — Table-level splitting within a shard:**
+- Each state-level table is capped at **1 million rows**
+- When a table grows beyond 1M rows, it splits into numbered child tables:
+  - `customers_north_up_1`, `customers_north_up_2`, `customers_north_up_3` …
+- The pipeline connector handles querying across all splits for a given state shard
+
+### 1.3 Core Source Tables (per company, per shard)
+- `customers_{zone}_{state}_{n}` — customer identity, PII, contact
+- `subscriptions_{zone}_{state}_{n}` — active/historical plan enrollments
+- `billing_accounts_{zone}_{state}_{n}` — billing cycle, dues, payment history
+- `sim_inventory_{zone}_{state}_{n}` — SIM serial, IMSI, activation date
+- `port_history_{zone}_{state}_{n}` — MNP in/out events
+
+---
+
+## Part 2 — ETL Pipeline Components
+
+### 2.1 Transformations
+
+Each pipeline applies a chain of transformers (matching the framework's `applyTransformations` function):
+
+| Transformer | Responsibility |
+|---|---|
+| `SchemaMapper` | Normalize column names across sources → unified schema (e.g., `mob_no` / `contact` / `phone_number` → `msisdn`) |
+| `TypeCaster` | MySQL `TINYINT` → Postgres `BOOLEAN`, `DATETIME` → `TIMESTAMPTZ`, `TEXT` → `VARCHAR(255)` etc. |
+| `NullHandler` | Fill missing state codes, default null plan info, flag null DOBs for backlog |
+| `PIIMasker` | Hash Aadhaar and PAN numbers using SHA-256 before write |
+| `PlanMapper` | Look up source plan code → destination plan code via AuxDB `plan_mapping` table |
+| `GeoTagger` | Inject `zone` and `state` as derived columns for destination partition routing |
+| `DedupChecker` | Check `dedup_registry` in AuxDB for cross-source identity conflicts (same MSISDN across companies) |
+| `UnitNormalizer` | Standardize data charges (MB → GB), currency formatting |
+
+Transformers are composable and chainable. A failed transformer sends the record to Backlog with `FailureStageTransform`.
+
+### 2.2 Checkpoints
+
+Checkpoints fire after every committed destination batch. State saved per checkpoint:
+
+- `source_company` — Vodafone / Idea / Tata Docomo / Aircel
+- `zone` — North / South / East / West / Central
+- `state` — e.g., UP, Tamil Nadu
+- `table_split_index` — which numbered split table (1, 2, 3…)
+- `last_processed_pk` — last primary key successfully written
+- `batch_id` — batch sequence within this shard run
+- `phase` — Extract / Transform / Load
+- `timestamp` — wall clock of checkpoint
+
+Checkpoint records are written to the **AuxDB** `pipeline_checkpoints` table. On resume, the pipeline connector reads the last checkpoint and begins extraction from `last_processed_pk + 1`.
+
+**Shard-level independence:** Each zone+state pipeline has its own checkpoint row. North-UP can resume independently of South-TN without conflict.
+
+**Table-split checkpoints:** If a state shard has multiple table splits, the checkpoint tracks which split is currently in-flight so resumption starts at the correct split.
+
+### 2.3 Incident Backlog
+
+Records that cannot be processed are routed to the **AuxDB** `backlog_records` table instead of failing the pipeline.
+
+**Backlog triggers:**
+- Hard transform failure — invalid MSISDN format, unresolvable plan code, unparseable date
+- Destination write failure — constraint violation, duplicate key on destination
+- Dedup conflict — same MSISDN found in two or more source companies, conflict resolution failed → both raw records go to backlog for manual review
+- Schema mismatch — unexpected column from source, missing required field
+- Null critical field — e.g., MSISDN is null (cannot route without it)
+
+**Backlog record metadata:**
+- `source_company`, `zone`, `state`, `table_split_index`
+- `batch_id`, `checkpoint_id`
+- `failure_stage` — Transform / Destination / Dedup
+- `error_code`, `error_message`
+- `raw_record` — full original record JSON
+- `retry_count`, `created_at`, `last_attempted_at`
+- `status` — PENDING / IN_RETRY / RESOLVED / ABANDONED
+
+**Reprocessing:** Backlog records with `status = PENDING` can be re-injected into the pipeline as a dedicated reprocessing flow (separate Flow definition in `collection.json`) after root cause is fixed.
+
+### 2.4 TerminateRule
+
+The TerminateRule is registered as a control plane ticker that fires at a configurable interval (stored in AuxDB `terminate_rules` table). Conditions checked on each tick:
+
+| Rule | Condition | Action |
+|---|---|---|
+| `ERROR_RATE_BREACH` | Backlog rate > 10% of batch records | Stop pipeline, preserve checkpoint |
+| `SOURCE_UNREACHABLE` | Source MySQL connection error after N retries | Graceful stop, trigger Collection-level retry |
+| `DESTINATION_SATURATION` | Destination write latency > threshold (ms) | Stop, alert, DestinationWriteTune slowify kicks in |
+| `INTEGRITY_VIOLATION` | Critical field (MSISDN) null rate > 5% in batch | Stop, flag shard for source data review |
+| `DUPLICATE_STORM` | Dedup conflict rate > 80% of batch | Stop, escalate to manual review |
+| `IDLE_TIMEOUT` | No records received for > N seconds | Stop, assume source exhausted |
+| `MANUAL_KILL` | Operator sets `force_stop = true` in AuxDB config | Graceful stop at next checkpoint boundary |
+| `MAX_RECORDS_REACHED` | Total records processed >= configured cap | Stop cleanly (useful for incremental runs) |
+
+Rules are stored in AuxDB and tunable at runtime without code changes.
+
+### 2.5 DestinationWriteTune
+
+The DestinationWriteTune is registered as a separate control plane ticker. It dynamically adjusts the destination write batch size based on current pipeline health metrics.
+
+**Speedify mode (bulk load / off-peak):**
+- Increase batch size (e.g., 5000 records/commit)
+- Disable non-critical destination indexes temporarily
+- Defer FK constraint checks to end of transaction
+- Use Postgres `COPY`-style bulk insert via staging table
+- Increase parallel write concurrency
+
+**Slowify mode (production hours / destination under load):**
+- Reduce batch size (e.g., 100 records/commit)
+- Introduce deliberate inter-batch sleep (configurable ms)
+- Reduce parallel write concurrency
+- Activate connection pooling limits
+
+**Config stored in AuxDB `write_tune_config`:**
+- `batch_size_normal`, `batch_size_turbo`, `batch_size_throttle`
+- `check_interval_seconds`
+- `throttle_schedule` — time-of-day windows for automatic slowify (e.g., 09:00–22:00 IST)
+- `destination_latency_threshold_ms`
+- `concurrency_limit`
+
+The `UserDefinedCheckFunc` in the `DestinationWriteTune` reads these config values from AuxDB on each tick and calls `SetDestinationWriteBatchSize` accordingly.
+
+### 2.6 Auxiliary DB
+
+A dedicated Postgres instance (or isolated database on the destination cluster) serves as the operational backbone of the ETL pipeline.
+
+**Tables in AuxDB:**
+
+| Table | Purpose |
+|---|---|
+| `pipeline_checkpoints` | Checkpoint state per shard per phase |
+| `backlog_records` | Failed/deferred records with full metadata |
+| `dedup_registry` | Cross-source MSISDN → canonical customer ID map |
+| `plan_mapping` | Source plan code → destination plan code lookup |
+| `terminate_rules` | Configurable termination thresholds per pipeline |
+| `write_tune_config` | Runtime-tunable batch size and concurrency settings |
+| `reconciliation_log` | Post-migration row counts and checksums per shard |
+| `audit_trail` | Before/after transformation snapshot per record (compliance) |
+| `customer_merge_log` | Trace of dedup merge decisions (which source won, which lost) |
+
+---
+
+## Part 3 — Destination Architecture (PostgreSQL)
+
+### 3.1 Schema Layers (4-layer promotion model)
+
+```
+raw schema        → Landing zone. Fast writes, no constraints. One table per source company.
+staging schema    → Deduped, normalized, constraints applied. Conflict resolution happens here.
+curated schema    → Golden records. Production-ready. The single source of truth.
+audit schema      → Immutable append-only log of every change. Compliance and rollback.
+```
+
+Promotion from raw → staging → curated runs as independent async jobs, not blocking inbound write lanes.
+
+### 3.2 Destination Partitioning
+
+Postgres declarative partitioning mirrors source sharding:
+
+```
+customers (partitioned by zone)
+  ├── customers_north (partitioned by state)
+  │     ├── customers_north_up
+  │     ├── customers_north_bihar
+  │     └── ...
+  ├── customers_south
+  ├── customers_east
+  ├── customers_west
+  └── customers_central
+```
+
+Each state partition uses range partitioning on `batch_sequence_id` to mirror the 1M row split concept from source. This ensures parallel writers from different shards land in non-overlapping partitions with **zero write contention**.
+
+### 3.3 Core Destination Tables (in `curated` schema)
+
+| Table | Description |
+|---|---|
+| `customers` | Canonical identity — msisdn, name, DOB, Aadhaar hash, PAN hash, zone, state, source_company, canonical_id |
+| `subscriptions` | Current and historical plan enrollments |
+| `billing_accounts` | Billing cycles, outstanding dues, payment history |
+| `sim_inventory` | SIM serial, IMSI, activation/deactivation dates |
+| `port_history` | MNP in/out events — critical for merger continuity |
+| `network_assignments` | Circle and tower assignment per customer |
+| `customer_merge_log` | Full trace of cross-source record merges |
+
+### 3.4 Write Safety Net
+
+- All destination writes use `INSERT ... ON CONFLICT DO UPDATE` (upsert) — pipeline runs are fully idempotent
+- Indexes built per partition AFTER bulk load, not during
+- FK constraints deferred to end of transaction during bulk load
+- Materialized views for analytics refreshed async — never block writes
+- Staging table swap pattern: write to `raw`, validate in `staging`, atomic promotion to `curated`
+
+---
+
+## Part 4 — Orchestration Design (Streamcraft Framework Mapping)
+
+### 4.1 Hierarchy
+
+```
+Collection  = The full Telecom Migration Job
+  │
+  ├── Flow  = {company}_{zone}   (4 companies × 5 zones = 20 Flows)
+  │     e.g., vodafone_north, idea_south, tata_docomo_east ...
+  │
+  └── Pipeline = {state}         (6–9 pipelines per Flow)
+        e.g., vodafone_north → up, bihar, jharkhand, hp, uttarakhand, punjab, haryana
+```
+
+Total pipelines at peak: **~20 flows × ~7 states avg = ~140 pipelines**
+
+### 4.2 Execution Queue Design
+
+The framework's `ExecutionQueueManager` manages:
+- **FlowQueue** — all 20 flows enqueued at collection start
+- **PipelineQueue** — flows are materialized into state pipelines on demand
+- **RetryQueue** — failed pipelines re-enter here with exponential backoff or immediate retry per `RetryPolicy` config
+
+Priority order: Retry → Pipeline → Materialize next Flow
+
+### 4.3 Flow Orchestrator (to be implemented — PID: new)
+
+Controls how many Flows (zone×company combos) execute concurrently.
+
+```go
+// FlowOrchestratorTune controls global flow-level concurrency
+type FlowOrchestratorTune struct {
+    MaxConcurrentFlows int   // e.g., 8 — limits MySQL source load
+    FlowPriority       []string // e.g., run Vodafone flows before Aircel
+}
+```
+
+This prevents overwhelming the 4 MySQL source servers simultaneously.
+
+### 4.4 Pipeline Orchestrator (PID: 2 — to be implemented)
+
+Controls how many Pipelines (state-level) run concurrently within a single Flow.
+
+```go
+// PipelineOrchestratorTune controls per-flow pipeline concurrency
+type PipelineOrchestratorTune struct {
+    MaxConcurrentPipelines int   // e.g., 3 states per zone at a time
+    BatchSize              int   // initial destination write batch size
+}
+```
+
+Config read from AuxDB `write_tune_config` at orchestration time.
+
+### 4.5 Peak Parallelism Model
+
+At full throttle:
+```
+8 concurrent Flows × 3 concurrent Pipelines per Flow = 24 active pipeline workers
++ 1 Aux write lane (checkpoints, backlogs, audit)
++ 1 Promotion job lane (raw → staging → curated)
++ 1 Reconciliation job lane (post-shard validation)
+= ~27 concurrent goroutine lanes
+```
+
+Each lane writes to a non-overlapping Postgres partition — zero contention.
+
+### 4.6 collection.json Structure (for this case study)
+
+```json
+{
+  "flowOrchestratorDefinition": { "Name": "telecom_flow_orchestrator", "PID": 1 },
+  "flowDefinition": [
+    {
+      "flow": { "pid": 1, "name": "vodafone_north" },
+      "pipelineOrchestratorDefintion": { "Name": "telecom_pipeline_orchestrator", "PID": 2 },
+      "source": { "type": "mysql", "connectionParams": "..." },
+      "destination": { "type": "postgres", "connectionParams": "..." },
+      "pipelines": [
+        {
+          "name": "up",
+          "sourceIsolationEntity": { "name": "customers_north_up", "pid": 1 },
+          "destinatioIsolationEntity": { "name": "raw.customers", "pid": 1 },
+          "transformers": [ { "pid": 1 }, { "pid": 2 }, { "pid": 3 }, { "pid": 4 }, { "pid": 5 }, { "pid": 6 }, { "pid": 7 } ],
+          "checkpoint": { "pid": 1 },
+          "backlog": { "pid": 1 },
+          "terminate": { "pid": 1 },
+          "auxilaryHubs": [
+            { "name": "auxdb", "type": "postgres", "connectionParams": "..." }
+          ]
+        }
+        // ... more state pipelines
+      ]
+    }
+    // ... 19 more flows
+  ]
+}
+```
+
+---
+
+## Part 5 — Step-by-Step Implementation Tasks
+
+### Phase 1 — Infrastructure Setup
+
+- [ ] **STEP-01** — Provision 4 MySQL source instances (one per company: Vodafone, Idea, Tata Docomo, Aircel)
+- [ ] **STEP-02** — Design and create source schema for each company with zone/state sharding and table-split naming convention (`customers_{zone}_{state}_{n}`)
+- [ ] **STEP-03** — Seed source databases with realistic synthetic telecom data (customers, subscriptions, billing, SIM inventory, port history) — target 3–5M records per company
+- [ ] **STEP-04** — Provision destination Postgres instance (Airtel / Jio)
+- [ ] **STEP-05** — Create `raw`, `staging`, `curated`, `audit` schemas on destination Postgres
+- [ ] **STEP-06** — Create destination tables with declarative partitioning (zone → state → batch range)
+- [ ] **STEP-07** — Provision AuxDB Postgres instance and create all AuxDB tables (checkpoints, backlog, dedup_registry, plan_mapping, terminate_rules, write_tune_config, reconciliation_log, audit_trail, customer_merge_log)
+- [ ] **STEP-08** — Seed AuxDB lookup tables: `plan_mapping` (all 4 source companies' plan codes → destination plan codes) and initial `terminate_rules` and `write_tune_config` rows
+
+### Phase 2 — Connector Implementation
+
+- [ ] **STEP-09** — Implement `IUseConnector` for each source company's MySQL (4 connectors) with support for querying split tables (`customers_{zone}_{state}_1`, `_2`, `_3` …) in sequence
+- [ ] **STEP-10** — Implement state-level source isolation entities (one per state per zone — these are the pipeline's `sourceIsolationEntity`) that read from the correct shard table set
+- [ ] **STEP-11** — Implement destination `IUseConnector` for Postgres targeting the `raw` schema with upsert (`INSERT ... ON CONFLICT DO UPDATE`)
+- [ ] **STEP-12** — Implement destination isolation entity for each partitioned table (routes records to the correct zone/state partition)
+
+### Phase 3 — Transformer Chain
+
+- [ ] **STEP-13** — Implement `SchemaMapper` transformer — normalize all source column names to unified destination schema per company
+- [ ] **STEP-14** — Implement `TypeCaster` transformer — handle all MySQL → Postgres type conversions
+- [ ] **STEP-15** — Implement `NullHandler` transformer — define rules for each nullable field (default, skip, backlog)
+- [ ] **STEP-16** — Implement `PIIMasker` transformer — SHA-256 hash Aadhaar and PAN fields
+- [ ] **STEP-17** — Implement `PlanMapper` transformer — look up `plan_mapping` table in AuxDB to resolve source plan codes
+- [ ] **STEP-18** — Implement `GeoTagger` transformer — inject `zone` and `state` columns derived from the pipeline's shard context (passed via `TransformerProps`)
+- [ ] **STEP-19** — Implement `DedupChecker` transformer — check AuxDB `dedup_registry` for MSISDN conflicts; resolve if possible, backlog if ambiguous
+- [ ] **STEP-20** — Implement `UnitNormalizer` transformer — standardize data units and currency formats
+- [ ] **STEP-21** — Wire transformer chain into pipeline `applyTransformations` (ordered: SchemaMapper → TypeCaster → NullHandler → PIIMasker → PlanMapper → GeoTagger → DedupChecker → UnitNormalizer)
+
+### Phase 4 — Pipeline Control Plane
+
+- [ ] **STEP-22** — Implement `Checkpoint` function — write shard state (company, zone, state, split index, last PK, batch ID, phase, timestamp) to AuxDB `pipeline_checkpoints`; implement resume logic in source connector to read last checkpoint and start from `last_processed_pk + 1`
+- [ ] **STEP-23** — Implement `Backlog` function — write failed records with full metadata (source, stage, error code, raw record JSON, retry count) to AuxDB `backlog_records`; define `BacklogTune.Action` for each failure type (Continue / Stop)
+- [ ] **STEP-24** — Implement `TerminateRule` — register all 8 termination conditions (error rate, source unreachable, destination saturation, integrity violation, duplicate storm, idle timeout, manual kill, max records); read thresholds from AuxDB `terminate_rules` on each tick
+- [ ] **STEP-25** — Implement `DestinationWriteTune` — `UserDefinedCheckFunc` reads `write_tune_config` from AuxDB on each tick; implements speedify (high batch size, index disable, bulk insert) and slowify (low batch size, inter-batch sleep, concurrency cap) modes with time-of-day scheduling
+
+### Phase 5 — Orchestration
+
+- [ ] **STEP-26** — Implement `FlowOrchestrator` (new PID) — controls max concurrent flows globally; reads `max_concurrent_flows` from AuxDB; optionally enforces flow priority order (e.g., Vodafone before Aircel)
+- [ ] **STEP-27** — Implement `PipelineOrchestrator` (PID: 2) — controls max concurrent pipelines per flow; reads `max_concurrent_pipelines` from AuxDB `write_tune_config`; returns `PipelineOrchestratorTune` array
+- [ ] **STEP-28** — Build `collection.json` for the full telecom migration: 20 flows (4 companies × 5 zones), each with 6–9 state pipelines, correct connector PIDs, transformer PIDs, checkpoint/backlog/terminate PIDs, and AuxDB hub connections
+
+### Phase 6 — Destination Promotion Jobs
+
+- [ ] **STEP-29** — Implement `raw → staging` promotion job — dedup within raw, apply constraints, write conflict resolutions to `customer_merge_log`, insert clean records into staging
+- [ ] **STEP-30** — Implement `staging → curated` promotion job — final validation, atomic swap into curated partition tables
+- [ ] **STEP-31** — Implement audit trail writer — after each promotion, append before/after snapshot to `audit.audit_trail`
+- [ ] **STEP-32** — Set up materialized views on `curated` schema for analytics queries (refresh async, do not block write lanes)
+
+### Phase 7 — Backlog Reprocessing Flow
+
+- [ ] **STEP-33** — Design and implement a dedicated reprocessing `Flow` definition that reads from AuxDB `backlog_records` (status = PENDING), re-runs through the transformer chain, and attempts destination write again
+- [ ] **STEP-34** — Implement retry count enforcement and ABANDONED status for records exceeding `max_retry` threshold
+- [ ] **STEP-35** — Add backlog reprocessing flow to `collection.json` as a separate flow that can be triggered independently
+
+### Phase 8 — Reconciliation & Validation
+
+- [ ] **STEP-36** — Implement post-shard reconciliation: after each pipeline completes, count source records vs destination `raw` records for that shard; write result to AuxDB `reconciliation_log`
+- [ ] **STEP-37** — Implement post-promotion reconciliation: count `curated` records vs source records per zone/state; flag discrepancies
+- [ ] **STEP-38** — Implement checksum validation: compare hash of key fields (msisdn, plan_code, state) between source and curated for a sample set per shard
+
+### Phase 9 — Observability
+
+- [ ] **STEP-39** — Add structured logging (already in framework via `zap`) at all key events: shard start/end, checkpoint written, backlog routed, termination triggered, tune adjusted, flow completed
+- [ ] **STEP-40** — Expose pipeline metrics (total records, backlog rate, checkpoint lag, destination write latency) — suitable for OpenTelemetry integration (framework has KAN-16 OTEL branch)
+- [ ] **STEP-41** — Build a simple reconciliation dashboard query set against AuxDB tables to give a live view of migration progress per company, zone, and state
+
+### Phase 10 — End-to-End Test Run
+
+- [ ] **STEP-42** — Run a single pipeline in isolation (Vodafone → North → UP) as smoke test — validate checkpoint, backlog, transform, and destination write all work correctly
+- [ ] **STEP-43** — Introduce intentional bad records (null MSISDN, invalid plan codes, duplicate MSISDNs across two companies) and verify backlog routing and dedup handling
+- [ ] **STEP-44** — Test TerminateRule triggers — artificially breach error rate threshold and verify graceful stop + checkpoint preservation
+- [ ] **STEP-45** — Test DestinationWriteTune — simulate off-peak (speedify) and peak hours (slowify) and verify batch size changes dynamically
+- [ ] **STEP-46** — Run full parallel execution: all 20 flows, all ~140 pipelines — monitor queue throughput, destination partition health, AuxDB backlog volume
+- [ ] **STEP-47** — Simulate mid-run failure: kill one pipeline mid-shard, verify checkpoint allows clean resume from last committed PK
+- [ ] **STEP-48** — Run backlog reprocessing flow on all PENDING backlog records — verify resolution rate and ABANDONED count
+- [ ] **STEP-49** — Run full reconciliation suite (STEP-36 to STEP-38) — verify source vs destination counts match within acceptable tolerance
+- [ ] **STEP-50** — Final sign-off: all curated records validated, all checkpoints marked complete, reconciliation log clean, audit trail populated
+
+---
+
+## Summary Reference
+
+| Dimension | Detail |
+|---|---|
+| Source DBs | 4 MySQL instances (Vodafone, Idea, Tata Docomo, Aircel) |
+| Sharding | Zone (5) → State (36 total) → Table splits (1M row cap) |
+| Total Flows | 20 (4 companies × 5 zones) |
+| Total Pipelines | ~140 (avg 7 states per zone) |
+| Peak Concurrency | 8 flows × 3 pipelines = 24 active workers |
+| Transformers | 8 chained transformers per pipeline |
+| Control Plane | TerminateRule + DestinationWriteTune (independent tickers) |
+| Checkpoints | Per shard, per phase, per table split — resume from last PK |
+| Backlog | AuxDB-backed, retryable, with failure stage metadata |
+| Destination | Postgres with raw → staging → curated promotion model |
+| Partitioning | Zone → State → Batch range (declarative, zero write contention) |
+| AuxDB Tables | 9 operational tables (checkpoints, backlog, dedup, plan map, rules, config, audit, reconciliation, merge log) |
+| Implementation Steps | 50 steps across 10 phases |
