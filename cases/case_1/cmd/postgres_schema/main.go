@@ -12,7 +12,7 @@ import (
 	"log"
 	"time"
 
-	_ "github.com/lib/pq"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/streamcraft/telecom-etl/db_setup/internal/config"
 	"github.com/streamcraft/telecom-etl/db_setup/internal/sharding"
@@ -53,17 +53,21 @@ func main() {
 }
 
 func connectWithRetry(dsn string, retries int) (*sql.DB, error) {
+	var lastErr error
 	for i := 0; i < retries; i++ {
-		db, err := sql.Open("postgres", dsn)
-		if err == nil {
-			if pingErr := db.Ping(); pingErr == nil {
-				return db, nil
-			}
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			lastErr = err
+		} else if pingErr := db.Ping(); pingErr != nil {
+			lastErr = pingErr
+			db.Close()
+		} else {
+			return db, nil
 		}
-		log.Printf("  waiting for Postgres... (%d/%d)", i+1, retries)
+		log.Printf("  waiting for Postgres... (%d/%d): %v", i+1, retries, lastErr)
 		time.Sleep(3 * time.Second)
 	}
-	return nil, fmt.Errorf("could not connect after %d retries", retries)
+	return nil, fmt.Errorf("could not connect after %d retries: %w", retries, lastErr)
 }
 
 func exec(db *sql.DB, ddl string) error {
@@ -109,7 +113,7 @@ CREATE TABLE IF NOT EXISTS raw.customers (
     msisdn              VARCHAR(15)  NOT NULL,
     name                VARCHAR(100),
     dob                 DATE,
-    aadhaar_hash        VARCHAR(64)  COMMENT_PLACEHOLDER,
+    aadhaar_hash        VARCHAR(64),
     pan_hash            VARCHAR(64),
     email               VARCHAR(150),
     address             TEXT,

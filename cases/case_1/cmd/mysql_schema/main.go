@@ -20,10 +20,11 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/streamcraft/telecom-etl/db_setup/internal/config"
 	"github.com/streamcraft/telecom-etl/db_setup/internal/sharding"
@@ -90,7 +91,7 @@ var companySchemas = map[string]companySchema{
 	"aircel": {
 		msisdnCol: "msisdn", nameCol: "name", dobCol: "dob",
 		aadhaarCol: "aadhaar_id", panCol: "pan_id", emailCol: "email_address",
-		addressCol: "full_address", activatedAt: "created_at",
+		addressCol: "full_address", activatedAt: "activated_at",
 		planCodeCol: "product_code", startCol: "start_date", endCol: "end_date", statusCol: "subscription_state",
 		dueAmountCol: "balance_due", paidAmountCol: "balance_paid", cycleStartCol: "cycle_open", cycleEndCol: "cycle_close",
 		simSerialCol: "sim_id", imsiCol: "imsi_number", simStatusCol: "active_flag",
@@ -99,6 +100,7 @@ var companySchemas = map[string]companySchema{
 }
 
 func main() {
+	mysql.SetLogger(log.New(io.Discard, "", 0))
 	log.Println("=== MySQL Schema Creator ===")
 
 	for _, company := range sharding.Companies {

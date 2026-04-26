@@ -17,8 +17,8 @@ func PostgresDSN(host string, port int, dbName string) string {
 // Defaults
 const (
 	DBHost          = "127.0.0.1"
-	DestinationPort = 5432
-	AuxDBPort       = 5433
+	DestinationPort = 5434
+	AuxDBPort       = 5435
 	DestinationDB   = "destination_db"
 	AuxDB           = "auxdb"
 )

@@ -16,7 +16,7 @@ import (
 	"log"
 	"time"
 
-	_ "github.com/lib/pq"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/streamcraft/telecom-etl/db_setup/internal/config"
 )
@@ -62,17 +62,21 @@ func main() {
 }
 
 func connectWithRetry(dsn string, retries int) (*sql.DB, error) {
+	var lastErr error
 	for i := 0; i < retries; i++ {
-		db, err := sql.Open("postgres", dsn)
-		if err == nil {
-			if pingErr := db.Ping(); pingErr == nil {
-				return db, nil
-			}
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			lastErr = err
+		} else if pingErr := db.Ping(); pingErr != nil {
+			lastErr = pingErr
+			db.Close()
+		} else {
+			return db, nil
 		}
-		log.Printf("  waiting for AuxDB... (%d/%d)", i+1, retries)
+		log.Printf("  waiting for AuxDB... (%d/%d): %v", i+1, retries, lastErr)
 		time.Sleep(3 * time.Second)
 	}
-	return nil, fmt.Errorf("could not connect after %d retries", retries)
+	return nil, fmt.Errorf("could not connect after %d retries: %w", retries, lastErr)
 }
 
 func exec(db *sql.DB, ddl string) error {

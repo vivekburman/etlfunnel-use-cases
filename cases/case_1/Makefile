@@ -16,6 +16,9 @@
 #   make logs        — tail all container logs
 #   make status      — show container health
 
+SHELL := C:/Program Files/Git/bin/bash.exe
+.SHELLFLAGS := -euo pipefail -c
+
 COMPOSE_FILE := docker-compose.yml
 RECORDS_PER_SHARD ?= 500
 WORKERS ?= 4
@@ -33,11 +36,11 @@ up:
 wait-healthy:
 	@echo "  Checking health..."
 	@for svc in vodafone_db idea_db tata_docomo_db aircel_db destination_db auxdb; do \
-		echo -n "  Waiting for $$svc "; \
+		printf "  Waiting for $$svc "; \
 		for i in $$(seq 1 30); do \
 			STATUS=$$(docker inspect --format='{{.State.Health.Status}}' $$svc 2>/dev/null || echo "missing"); \
-			if [ "$$STATUS" = "healthy" ]; then echo " ✓"; break; fi; \
-			echo -n "."; sleep 3; \
+			if [ "$$STATUS" = "healthy" ]; then printf " ✓\n"; break; fi; \
+			printf "."; sleep 3; \
 		done; \
 	done
 	@echo ">>> All containers healthy"
@@ -93,8 +96,8 @@ setup: up mysql postgres auxdb seed
 	@echo "    tata_docomo_db → localhost:3308"
 	@echo "    aircel_db      → localhost:3309"
 	@echo ""
-	@echo "  Postgres destination → localhost:5432 / destination_db"
-	@echo "  AuxDB               → localhost:5433 / auxdb"
+	@echo "  Postgres destination → localhost:5434 / destination_db"
+	@echo "  AuxDB               → localhost:5435 / auxdb"
 	@echo ""
 	@echo "  Credentials: user=etl_user  password=etl_pass"
 	@echo "============================================"

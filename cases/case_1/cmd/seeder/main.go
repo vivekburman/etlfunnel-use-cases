@@ -25,13 +25,14 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/streamcraft/telecom-etl/db_setup/internal/config"
 	"github.com/streamcraft/telecom-etl/db_setup/internal/sharding"
@@ -83,7 +84,7 @@ var colMap = map[string]companyColumns{
 	"aircel": {
 		msisdn: "msisdn", name: "name", dob: "dob",
 		aadhaar: "aadhaar_id", pan: "pan_id", email: "email_address",
-		address: "full_address", activatedAt: "created_at",
+		address: "full_address", activatedAt: "activated_at",
 		planCode: "product_code", planStart: "start_date", planEnd: "end_date", subStatus: "subscription_state",
 		dueAmount: "balance_due", paidAmount: "balance_paid", cycleStart: "cycle_open", cycleEnd: "cycle_close",
 		simSerial: "sim_id", imsi: "imsi_number", simStatus: "active_flag",
@@ -157,6 +158,7 @@ func main() {
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 
+	mysql.SetLogger(log.New(io.Discard, "", 0))
 	log.Println("=== Telecom Synthetic Data Seeder ===")
 	log.Printf("Records per shard: %d | Workers: %d | Split cap: %d\n",
 		*recordsPerShard, *workers, sharding.SplitRowCap)
@@ -227,18 +229,29 @@ func seedCompany(companyName, dbName string, port int, st sharding.ShardingType,
 	cols := colMap[companyName]
 	plans := sourcePlanCodes[companyName]
 
+	var mu sync.Mutex
+	var shardsOK, shardsFailed int
+
 	for w := 0; w < *workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for task := range taskCh {
 				if err := seedShard(db, companyName, cols, plans, task, sharedMSISDNs); err != nil {
-					log.Printf("[%s] shard %s error: %v", companyName, task.key(), err)
+					mu.Lock()
+					shardsFailed++
+					mu.Unlock()
+					log.Printf("[%s] shard %-25s SKIPPED — %v", companyName, task.key(), err)
+				} else {
+					mu.Lock()
+					shardsOK++
+					mu.Unlock()
 				}
 			}
 		}()
 	}
 	wg.Wait()
+	log.Printf("[%s] shards seeded: %d ok, %d skipped (bad-data batches)", companyName, shardsOK, shardsFailed)
 	return nil
 }
 
@@ -414,7 +427,7 @@ func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, 
 
 		var dob interface{}
 		if rand.Float64() < 0.01 {
-			dob = "INVALID_DATE"
+			dob = nil // intentional null DOB (~1%) — exercises NullHandler/Backlog in the ETL pipeline
 		} else {
 			dob = randomDate(1960, 2000)
 		}
@@ -438,7 +451,7 @@ func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, 
 		}
 	}
 	if err := flushCustomers(); err != nil {
-		return err
+		return fmt.Errorf("customer batch: %w", err)
 	}
 
 	if len(allCustomers) == 0 {

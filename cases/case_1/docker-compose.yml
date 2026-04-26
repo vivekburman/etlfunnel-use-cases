@@ -130,8 +130,9 @@ services:
       POSTGRES_DB: destination_db
       POSTGRES_USER: etl_user
       POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - destination_pg_data:/var/lib/postgresql/data
     networks:
@@ -154,8 +155,9 @@ services:
       POSTGRES_DB: auxdb
       POSTGRES_USER: etl_user
       POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
-      - "5433:5432"
+      - "5435:5432"
     volumes:
       - auxdb_pg_data:/var/lib/postgresql/data
     networks:
