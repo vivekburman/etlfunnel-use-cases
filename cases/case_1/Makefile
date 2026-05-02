@@ -12,8 +12,9 @@
 #   make seed-scale  — production-scale seed (1.1M rec/shard, triggers dynamic table splits)
 #   make setup       — run ALL of the above in order (full bootstrap)
 #   make down        — stop and remove containers (keeps volumes)
-#   make reset       — stop containers AND destroy volumes (DESTRUCTIVE)
-#   make logs        — tail all container logs
+#   make reset           — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make clean-migration — wipe destination + AuxDB state for a fresh pipeline re-run (keeps source data & config)
+#   make logs            — tail all container logs
 #   make status      — show container health
 
 SHELL := C:/Program Files/Git/bin/bash.exe
@@ -23,7 +24,7 @@ COMPOSE_FILE := docker-compose.yml
 RECORDS_PER_SHARD ?= 500
 WORKERS ?= 4
 
-.PHONY: up down reset deps mysql postgres auxdb seed setup logs status wait-healthy
+.PHONY: up down reset clean-migration deps mysql postgres auxdb seed setup logs status wait-healthy
 
 ## Start all 6 containers
 up:
@@ -100,6 +101,27 @@ setup: up mysql postgres auxdb seed
 	@echo "  AuxDB               → localhost:5435 / auxdb"
 	@echo ""
 	@echo "  Credentials: user=etl_user  password=etl_pass"
+	@echo "============================================"
+
+## Wipe destination + AuxDB state for a fresh migration re-run (source data and config are untouched)
+clean-migration:
+	@echo ">>> Truncating destination DB tables (raw, staging, curated, audit)..."
+	@docker exec -e PGPASSWORD=etl_pass destination_db \
+		psql -U etl_user -d destination_db -c \
+		"TRUNCATE raw.customers, raw.subscriptions, raw.billing_accounts, raw.sim_inventory, raw.port_history, staging.customers, staging.subscriptions, staging.billing_accounts, staging.sim_inventory, staging.port_history, curated.customers, curated.subscriptions, curated.billing_accounts, curated.sim_inventory, curated.port_history, curated.network_assignments, curated.customer_merge_log, audit.audit_trail RESTART IDENTITY CASCADE;"
+	@echo ">>> Clearing AuxDB migration state tables..."
+	@docker exec -e PGPASSWORD=etl_pass auxdb \
+		psql -U etl_user -d auxdb -c \
+		"TRUNCATE pipeline_checkpoints, backlog_records, dedup_registry, reconciliation_log, audit_trail, customer_merge_log RESTART IDENTITY CASCADE;"
+	@echo ""
+	@echo "============================================"
+	@echo "  Migration state cleared — ready to re-run"
+	@echo "============================================"
+	@echo "  Destination DB : raw/staging/curated/audit tables truncated (schemas intact)"
+	@echo "  AuxDB cleared  : checkpoints, backlogs, dedup, reconciliation,"
+	@echo "                   audit_trail, customer_merge_log"
+	@echo "  AuxDB preserved: plan_mapping, terminate_rules, write_tune_config"
+	@echo "  Source DBs     : untouched (MySQL data intact)"
 	@echo "============================================"
 
 ## Stop containers (keep volumes)
