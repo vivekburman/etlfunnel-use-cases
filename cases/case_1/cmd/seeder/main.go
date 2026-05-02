@@ -38,6 +38,8 @@ import (
 	"github.com/streamcraft/telecom-etl/db_setup/internal/sharding"
 )
 
+const insertBatchSize = 5000
+
 var (
 	recordsPerShard = flag.Int("records-per-shard", 500, "number of customer records to insert per shard")
 	workers         = flag.Int("workers", 4, "parallel worker goroutines per company")
@@ -334,7 +336,7 @@ func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, 
 
 	var allCustomers []customerRecord
 
-	batchSize := 100
+	batchSize := insertBatchSize
 	type rowData struct {
 		msisdn      interface{}
 		name        string
@@ -525,7 +527,7 @@ func seedSubscriptions(db *sql.DB, suffix string, cols companyColumns, plans []s
 		"INSERT INTO subscriptions_%s (customer_id, %s, %s, %s, %s, %s%s, table_split) VALUES ",
 		suffix, cols.msisdn, cols.planCode, cols.planStart, cols.planEnd, cols.subStatus, geoNames,
 	)
-	return batchInsert(db, prefix, rows, args, 200)
+	return batchInsert(db, prefix, rows, args, insertBatchSize)
 }
 
 func seedBillingAccounts(db *sql.DB, suffix string, cols companyColumns, customers []customerRecord, task shardTask) error {
@@ -552,7 +554,7 @@ func seedBillingAccounts(db *sql.DB, suffix string, cols companyColumns, custome
 		"INSERT INTO billing_accounts_%s (customer_id, %s, %s, %s, %s, %s, bill_status%s, table_split) VALUES ",
 		suffix, cols.msisdn, cols.dueAmount, cols.paidAmount, cols.cycleStart, cols.cycleEnd, geoNames,
 	)
-	return batchInsert(db, prefix, rows, args, 200)
+	return batchInsert(db, prefix, rows, args, insertBatchSize)
 }
 
 func seedSimInventory(db *sql.DB, suffix string, cols companyColumns, customers []customerRecord, task shardTask) error {
@@ -577,7 +579,7 @@ func seedSimInventory(db *sql.DB, suffix string, cols companyColumns, customers 
 		"INSERT INTO sim_inventory_%s (customer_id, %s, %s, %s, %s, activated_date%s, table_split) VALUES ",
 		suffix, cols.msisdn, cols.simSerial, cols.imsi, cols.simStatus, geoNames,
 	)
-	return batchInsert(db, prefix, rows, args, 200)
+	return batchInsert(db, prefix, rows, args, insertBatchSize)
 }
 
 func seedPortHistory(db *sql.DB, suffix string, cols companyColumns, customers []customerRecord, task shardTask) error {
@@ -609,7 +611,7 @@ func seedPortHistory(db *sql.DB, suffix string, cols companyColumns, customers [
 		"INSERT INTO port_history_%s (customer_id, %s, %s, %s, %s, port_date, porting_ref%s, table_split) VALUES ",
 		suffix, cols.msisdn, cols.portType, cols.fromCarrier, cols.toCarrier, geoNames,
 	)
-	return batchInsert(db, prefix, rows, args, 200)
+	return batchInsert(db, prefix, rows, args, insertBatchSize)
 }
 
 // ---------- Dynamic split table creation ----------
