@@ -14,14 +14,16 @@
 //   aircel      — zone + state  (customers_north_up_1, _2, …)
 //
 // Intentional data quality issues injected to exercise the transformer chain:
-//   ~3% null MSISDNs  (triggers NullHandler / Backlog)
-//   ~5% duplicate MSISDNs across companies (triggers DedupChecker)
-//   ~2% invalid plan codes (triggers PlanMapper backlog path)
-//   ~1% unparseable dates
+//   ~3% null MSISDNs          (triggers NullHandler / Backlog)
+//   ~5% duplicate MSISDNs     (triggers DedupChecker)
+//   ~2% invalid plan codes    (triggers PlanMapper / Backlog)
+//   ~1% unparseable dates     (activation_date set to "0000-00-00 00:00:00" via sql_mode override
+//                              — triggers TypeCaster ParseDate failure / Backlog)
 
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -460,6 +462,11 @@ func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, 
 		return nil
 	}
 
+	// Inject ~1% zero-dates into activatedAt to exercise TypeCaster ParseDate → Backlog.
+	if err := injectBadActivationDates(db, task, cols.activatedAt, allCustomers); err != nil {
+		log.Printf("  shard %s: bad-date injection warning — %v", task.key(), err)
+	}
+
 	// Group customers by split so child tables land in the matching split table.
 	bySplit := map[int][]customerRecord{}
 	for _, c := range allCustomers {
@@ -839,6 +846,57 @@ CREATE TABLE IF NOT EXISTS port_history_%s (
 		geoColsDDL(hasZone, hasState),
 		s.msisdn,
 	)
+}
+
+// ---------- Bad-data injectors ----------
+
+// injectBadActivationDates corrupts ~1% of customer activation_date values to "0000-00-00 00:00:00".
+// MySQL's NO_ZERO_DATE strict mode rejects zero dates on normal inserts, so we temporarily
+// disable the session sql_mode, run the UPDATE, then restore it — all on a dedicated connection
+// so the mode change doesn't leak to other pool connections.
+func injectBadActivationDates(db *sql.DB, task shardTask, activatedAtCol string, customers []customerRecord) error {
+	bySplit := map[int][]int64{}
+	for _, c := range customers {
+		if rand.Float64() < 0.01 {
+			bySplit[c.split] = append(bySplit[c.split], c.id)
+		}
+	}
+	if len(bySplit) == 0 {
+		return nil
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(context.Background(), "SET SESSION sql_mode = ''"); err != nil {
+		return err
+	}
+	// Always restore the MySQL 8.0 default strict mode before returning the connection to the pool.
+	defer conn.ExecContext(context.Background(), //nolint
+		"SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+	)
+
+	for split, ids := range bySplit {
+		placeholders := make([]string, len(ids))
+		args := make([]interface{}, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		query := fmt.Sprintf(
+			"UPDATE customers_%s SET %s = '0000-00-00 00:00:00' WHERE id IN (%s)",
+			task.suffix(split), activatedAtCol, strings.Join(placeholders, ","),
+		)
+		if _, err := conn.ExecContext(context.Background(), query, args...); err != nil {
+			return err
+		}
+		log.Printf("  shard %s split %d: corrupted %d activation_date(s) to zero-date for backlog testing",
+			task.key(), split, len(ids))
+	}
+	return nil
 }
 
 // ---------- Helpers ----------

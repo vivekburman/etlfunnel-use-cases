@@ -123,7 +123,8 @@ CREATE TABLE IF NOT EXISTS raw.customers (
     table_split         SMALLINT     NOT NULL DEFAULT 1,
     batch_id            BIGINT,
     raw_record          JSONB,
-    ingested_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    ingested_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_raw_customers_msisdn_company UNIQUE (msisdn, source_company)
 );`
 }
 
