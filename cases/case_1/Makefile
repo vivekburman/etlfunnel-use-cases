@@ -9,7 +9,7 @@
 #   make postgres    — create destination Postgres schemas (raw/staging/curated/audit + partitions)
 #   make auxdb       — create AuxDB schemas + seed plan_mapping, terminate_rules, write_tune_config
 #   make seed        — insert synthetic telecom data (500 rec/shard, smoke-test volume)
-#   make seed-scale  — production-scale seed (1.1M rec/shard, triggers dynamic table splits)
+#   make seed-scale  — scale seed (100K rec/shard, split cap 50K → forces dynamic table splits)
 #   make setup       — run ALL of the above in order (full bootstrap)
 #   make down        — stop and remove containers (keeps volumes)
 #   make reset           — stop containers AND destroy volumes (DESTRUCTIVE)
@@ -23,6 +23,7 @@ SHELL := C:/Program Files/Git/bin/bash.exe
 COMPOSE_FILE := docker-compose.yml
 RECORDS_PER_SHARD ?= 500
 WORKERS ?= 4
+SPLIT_ROW_CAP ?= 1000000
 
 .PHONY: up down reset clean-migration deps mysql postgres auxdb seed setup logs status wait-healthy
 
@@ -72,16 +73,19 @@ auxdb: deps
 
 ## Seed synthetic data into MySQL source DBs
 seed: deps
-	@echo ">>> Seeding synthetic data ($(RECORDS_PER_SHARD) records/shard, $(WORKERS) workers)..."
-	go run ./cmd/seeder --records-per-shard=$(RECORDS_PER_SHARD) --workers=$(WORKERS)
+	@echo ">>> Seeding synthetic data ($(RECORDS_PER_SHARD) records/shard, $(WORKERS) workers, split cap $(SPLIT_ROW_CAP))..."
+	go run ./cmd/seeder --records-per-shard=$(RECORDS_PER_SHARD) --workers=$(WORKERS) --split-row-cap=$(SPLIT_ROW_CAP)
 	@echo ">>> Seeding done"
 
-## Production-scale seed — 1.1M records/shard guarantees at least one dynamic split per shard.
-## Runtime: long (tens of minutes). Ensure Docker containers have sufficient disk + memory.
+## Scale seed — seeds RECORDS_PER_SHARD records with a lower split cap to force dynamic table splits.
+## Default: 100K records/shard, split cap 50K → guarantees at least one _2 split per shard.
+## Override: make seed-scale RECORDS_PER_SHARD=200000 SPLIT_ROW_CAP=100000
+seed-scale: RECORDS_PER_SHARD = 100000
+seed-scale: SPLIT_ROW_CAP = 50000
 seed-scale: deps
-	@echo ">>> Production-scale seeding (1100000 records/shard, $(WORKERS) workers)..."
-	@echo ">>> Each shard will overflow 1M rows and trigger dynamic split _2 creation."
-	go run ./cmd/seeder --records-per-shard=1100000 --workers=$(WORKERS)
+	@echo ">>> Scale seeding ($(RECORDS_PER_SHARD) records/shard, split cap $(SPLIT_ROW_CAP), $(WORKERS) workers)..."
+	@echo ">>> Each shard will overflow the split cap and trigger dynamic split _2 creation."
+	go run ./cmd/seeder --records-per-shard=$(RECORDS_PER_SHARD) --workers=$(WORKERS) --split-row-cap=$(SPLIT_ROW_CAP)
 	@echo ">>> Scale seeding done"
 
 ## Full bootstrap: up → mysql → postgres → auxdb → seed

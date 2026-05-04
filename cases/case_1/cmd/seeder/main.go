@@ -1,11 +1,12 @@
 // seeder — generates and inserts realistic synthetic telecom data into all 4 MySQL source databases.
 //
 // Usage:
-//   go run ./cmd/seeder [--records-per-shard N]
+//   go run ./cmd/seeder [--records-per-shard N] [--split-row-cap N]
 //
-// Default: 500 records per shard.
-// Dynamic table splits: when a shard table reaches sharding.SplitRowCap (1,000,000 rows),
+// Default: 500 records per shard, split cap 1,000,000.
+// Dynamic table splits: when a shard table reaches --split-row-cap rows,
 // the seeder creates the next split table on the fly (_2, _3, …) and continues inserting there.
+// Lower --split-row-cap to force splits at smaller record counts (e.g. for testing).
 //
 // Sharding strategy per company:
 //   vodafone    — zone + state  (customers_north_up_1, _2, …)
@@ -45,6 +46,7 @@ const insertBatchSize = 5000
 var (
 	recordsPerShard = flag.Int("records-per-shard", 500, "number of customer records to insert per shard")
 	workers         = flag.Int("workers", 4, "parallel worker goroutines per company")
+	splitRowCap     = flag.Int("split-row-cap", sharding.SplitRowCap, "rows per shard table before a new split is created")
 )
 
 // ---------- Column name map (mirrors mysql_schema companySchemas) ----------
@@ -408,7 +410,7 @@ func seedShard(db *sql.DB, company string, cols companyColumns, plans []string, 
 
 	for i := 0; i < toInsert; i++ {
 		// Check if we've hit the split cap — flush first, then advance split.
-		if splitRowCount >= sharding.SplitRowCap {
+		if splitRowCount >= *splitRowCap {
 			if err := flushCustomers(); err != nil {
 				return fmt.Errorf("flush before split: %w", err)
 			}
