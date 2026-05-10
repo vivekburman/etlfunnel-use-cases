@@ -1,0 +1,170 @@
+version: "3.9"
+
+# ============================================================
+# Telecom ETL Case Study — Docker Compose
+# 4x MySQL source DBs + 1x Postgres destination + 1x AuxDB
+# ============================================================
+
+networks:
+  telecom_net:
+    driver: bridge
+
+volumes:
+  vodafone_data:
+  idea_data:
+  tata_docomo_data:
+  aircel_data:
+  destination_pg_data:
+  auxdb_pg_data:
+
+services:
+
+  # ----------------------------------------------------------
+  # SOURCE 1 — Vodafone MySQL
+  # ----------------------------------------------------------
+  vodafone_db:
+    image: mysql:8.0
+    container_name: vodafone_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: vodafone_db
+      MYSQL_USER: etl_user
+      MYSQL_PASSWORD: etl_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - vodafone_data:/var/lib/mysql
+    networks:
+      - telecom_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # SOURCE 2 — Idea MySQL
+  # ----------------------------------------------------------
+  idea_db:
+    image: mysql:8.0
+    container_name: idea_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: idea_db
+      MYSQL_USER: etl_user
+      MYSQL_PASSWORD: etl_pass
+    ports:
+      - "3307:3306"
+    volumes:
+      - idea_data:/var/lib/mysql
+    networks:
+      - telecom_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # SOURCE 3 — Tata Docomo MySQL
+  # ----------------------------------------------------------
+  tata_docomo_db:
+    image: mysql:8.0
+    container_name: tata_docomo_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: tata_docomo_db
+      MYSQL_USER: etl_user
+      MYSQL_PASSWORD: etl_pass
+    ports:
+      - "3308:3306"
+    volumes:
+      - tata_docomo_data:/var/lib/mysql
+    networks:
+      - telecom_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # SOURCE 4 — Aircel MySQL
+  # ----------------------------------------------------------
+  aircel_db:
+    image: mysql:8.0
+    container_name: aircel_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: aircel_db
+      MYSQL_USER: etl_user
+      MYSQL_PASSWORD: etl_pass
+    ports:
+      - "3309:3306"
+    volumes:
+      - aircel_data:/var/lib/mysql
+    networks:
+      - telecom_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # DESTINATION — Airtel/Jio Postgres
+  # ----------------------------------------------------------
+  destination_db:
+    image: postgres:15
+    container_name: destination_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: destination_db
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5434:5432"
+    volumes:
+      - destination_pg_data:/var/lib/postgresql/data
+    networks:
+      - telecom_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d destination_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ----------------------------------------------------------
+  # AUX DB — ETL operational backbone Postgres
+  # ----------------------------------------------------------
+  auxdb:
+    image: postgres:15
+    container_name: auxdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auxdb
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5435:5432"
+    volumes:
+      - auxdb_pg_data:/var/lib/postgresql/data
+    networks:
+      - telecom_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d auxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
