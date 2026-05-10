@@ -16,6 +16,8 @@
 #   make clean-migration — wipe destination + AuxDB state for a fresh pipeline re-run (keeps source data & config)
 #   make logs            — tail all container logs
 #   make status      — show container health
+#   make watch       — start the live metrics watcher (polls pipeline progress until Ctrl+C)
+#                      Override: make watch INTERVAL=10s
 
 SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -euo pipefail -c
@@ -25,7 +27,12 @@ RECORDS_PER_SHARD ?= 500
 WORKERS ?= 4
 SPLIT_ROW_CAP ?= 1000000
 
-.PHONY: up down reset clean-migration deps mysql postgres auxdb seed setup logs status wait-healthy
+AUXDB_DSN  ?= host=localhost port=5435 dbname=auxdb user=etl_user password=etl_pass sslmode=disable
+DESTDB_DSN ?= host=localhost port=5434 dbname=destination_db user=etl_user password=etl_pass sslmode=disable
+INTERVAL   ?= 5s
+WATCH_LOG  ?= metrics.log
+
+.PHONY: up down reset clean-migration deps mysql postgres auxdb seed setup logs status wait-healthy watch
 
 ## Start all 6 containers
 up:
@@ -144,3 +151,14 @@ logs:
 ## Container status
 status:
 	docker compose -f $(COMPOSE_FILE) ps
+
+## watch — live metrics dashboard (polls AuxDB + DestDB until Ctrl+C)
+##   Dumps to $(WATCH_LOG) (default: metrics.log) AND stdout. File is cleared on each run.
+##   Override: make watch INTERVAL=10s
+##             make watch WATCH_LOG=run1.log
+watch:
+	go run ./cmd/metrics_watcher \
+		--auxdb   "$(AUXDB_DSN)" \
+		--destdb  "$(DESTDB_DSN)" \
+		--interval $(INTERVAL) \
+		--log     $(WATCH_LOG)

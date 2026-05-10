@@ -428,6 +428,106 @@ Each lane writes to a non-overlapping Postgres partition — zero contention.
 
 ---
 
+## Part 11 — Live Metrics Monitor
+
+### 11.1 Purpose
+
+While the pipeline runs you need continuous visibility into whether records are actually moving from source to destination, whether the checkpoint is advancing, and whether the backlog is growing. The metrics watcher is a standalone Go program that polls AuxDB and the destination DB on a configurable interval and prints a live terminal dashboard until you press Ctrl+C.
+
+### 11.2 What It Monitors
+
+| Section | Data Source | What It Tells You |
+|---|---|---|
+| **Checkpoint progress** | `auxdb.pipeline_checkpoints` | Per-shard: last committed PK, records processed, delta since last tick (throughput) |
+| **Active pipelines** | `auxdb.pipeline_checkpoints` | How many shards had a checkpoint written in the last 30 s — confirms goroutines are live |
+| **Destination row counts** | `destination_db.raw.*` | How many rows have landed per table — validates source → destination flow |
+| **Backlog summary** | `auxdb.backlog_records` | Count by status (PENDING / IN_RETRY / RESOLVED / ABANDONED) × failure stage (Transform / Destination) |
+| **Backlog rate** | Both | `total_backlog / total_records_processed` — the key health signal; TerminateRule fires at >10% |
+| **Write tune config** | `auxdb.write_tune_config` | Current Normal / Turbo / Throttle batch sizes — shows whether speedify or slowify is active |
+
+### 11.3 Throughput Signal
+
+The watcher tracks `records_processed` per shard key (`company|zone|state|split`) across ticks. The delta column in the checkpoint table shows how many records each shard committed since the previous poll. A shard showing `idle` for more than 2–3 consecutive ticks while still `IN_PROGRESS` status means either the source is slow, a TerminateRule has paused it, or the goroutine has exited unexpectedly.
+
+### 11.4 Running It
+
+```bash
+go run ./cmd/metrics_watcher \
+  --auxdb  "host=localhost port=5435 dbname=auxdb user=etl_user password=etl_pass sslmode=disable" \
+  --destdb "host=localhost port=5434 dbname=destination_db user=etl_user password=etl_pass sslmode=disable" \
+  --interval 5s
+```
+
+Flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--auxdb` | localhost:5435/auxdb | AuxDB Postgres connection string |
+| `--destdb` | localhost:5434/destination_db | Destination DB connection string |
+| `--interval` | `5s` | Poll interval — accepts Go duration syntax (5s, 10s, 1m) |
+
+### 11.5 Sample Output
+
+```
+══════════════════════════════════════════════════════════════════════════════════════════
+  TELECOM ETL METRICS  —  2026-05-09 15:32:01  (tick #12)
+══════════════════════════════════════════════════════════════════════════════════════════
+
+  CHECKPOINT PROGRESS
+  Company        Zone         State            Split      Last PK    Batch  Phase          Status       Rows (+/tick)
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  aircel         central      chhattisgarh         1       823,410   56732  Transform/Load IN_PROGRESS  823,410 (+8,420)
+  aircel         central      mp                   1       742,100   56731  Transform/Load IN_PROGRESS  742,100 (+7,820)
+  vodafone       north        up                   1     1,024,000   56740  Transform/Load IN_PROGRESS  1,024,000 (+9,100)
+  vodafone       north        up                   2       120,340   56741  Transform/Load IN_PROGRESS  120,340 (+1,200)
+  idea           south        kerala               1       501,230   56738  Transform/Load IN_PROGRESS  501,230 (idle)
+  ...
+
+  ACTIVE PIPELINES (updated in last 30s): 14 / 20
+
+  DESTINATION ROW COUNTS (raw schema)
+  customers:            3,245,780
+  subscriptions:        3,240,100
+  billing_accounts:     3,238,900
+  sim_inventory:        2,987,400
+  port_history:         1,340,200
+
+  BACKLOG SUMMARY  (status × failure_stage)
+  Status       Stage           Count
+  ──────────────────────────────────────
+  PENDING      Transform           423
+  PENDING      Destination          12
+  IN_RETRY     Transform            18
+  RESOLVED     Transform           102
+
+  Total records processed: 12,450,000  |  Total backlog: 555  |  Backlog rate: 0.0045%
+
+  WRITE TUNE CONFIG  —  Normal: 1,000  |  Turbo: 5,000  |  Throttle: 100
+```
+
+### 11.6 What to Watch For
+
+| Signal | Threshold | Likely Cause |
+|---|---|---|
+| Backlog rate climbing | Approaching 10% | Transformer failures, plan code mismatches, dedup storms — check `failure_stage` breakdown |
+| Shard `idle` for 3+ ticks | Any | TerminateRule triggered, source connection dropped, goroutine panic |
+| Destination count stalled | Any | Destination write failures, `write_tune_config` set to Throttle, destination saturation |
+| Active pipelines < expected | < flows × pipelines | Some goroutines exited — cross-check `status = COMPLETE` vs `IN_PROGRESS` in checkpoint table |
+| Write tune Throttle active | Batch size = Throttle | Peak-hours slowify kicked in — normal if within scheduled window, abnormal otherwise |
+
+### 11.7 Implementation Location
+
+```
+cases/case_1/
+  cmd/
+    metrics_watcher/
+      main.go     ← standalone Go program, part of the case_1 module
+```
+
+No new dependencies — uses `github.com/jackc/pgx/v5` already in `go.mod`.
+
+---
+
 ## Summary Reference
 
 | Dimension | Detail |
