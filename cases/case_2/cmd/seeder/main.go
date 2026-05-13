@@ -323,8 +323,8 @@ func seedCity(db *sql.DB, brand brands.Brand, city brands.City, sharedOrderIDs [
 	}
 
 	if len(orderIDs) == 0 {
-		// fallback: query inserted order IDs
-		rows, err := db.Query(fmt.Sprintf("SELECT order_id FROM orders_%s_%d LIMIT $1", city.Name, splitNum), *recordsPerCity)
+		// fallback: query inserted order IDs using a literal limit (LIMIT $1 is untyped)
+		rows, err := db.Query(fmt.Sprintf("SELECT order_id FROM orders_%s_%d LIMIT %d", city.Name, splitNum, *recordsPerCity))
 		if err == nil {
 			defer rows.Close()
 			for rows.Next() {
@@ -353,88 +353,62 @@ func seedOrderItems(db *sql.DB, brandName, city string, split int, orderIDs []in
 	if len(orderIDs) == 0 {
 		return nil
 	}
-
-	var rows []string
-	var args []interface{}
-	argIdx := 1
-
+	var allArgs []interface{}
 	for _, orderID := range orderIDs {
-		itemCount := rand.Intn(5) + 1
-		for j := 0; j < itemCount; j++ {
-			productID := rand.Int63n(10000) + 1
-			productName := productNames[rand.Intn(len(productNames))]
-			qty := rand.Intn(5) + 1
-			price := float64(rand.Intn(500)+20) + rand.Float64()
-
-			rows = append(rows, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, %d)",
-				argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, split))
-			args = append(args, orderID, productID, productName, qty, price)
-			argIdx += 5
+		for j := 0; j < rand.Intn(5)+1; j++ {
+			allArgs = append(allArgs,
+				orderID,
+				rand.Int63n(10000)+1,
+				productNames[rand.Intn(len(productNames))],
+				rand.Intn(5)+1,
+				float64(rand.Intn(500)+20)+rand.Float64(),
+				split,
+			)
 		}
 	}
-
-	return batchInsertRaw(db,
-		fmt.Sprintf("INSERT INTO order_items_%s_%d (order_id, product_id, product_name, quantity, unit_price, city_split) VALUES ", city, split),
-		rows, args)
+	return batchInsert(db,
+		fmt.Sprintf("INSERT INTO order_items_%s_%d (order_id, product_id, product_name, quantity, unit_price, city_split) VALUES", city, split),
+		6, allArgs)
 }
 
 func seedOrderStatusEvents(db *sql.DB, brandName, city string, split int, orderIDs []int64, terminalStatus string) error {
 	if len(orderIDs) == 0 {
 		return nil
 	}
-
-	var rows []string
-	var args []interface{}
-	argIdx := 1
-
+	var allArgs []interface{}
 	for _, orderID := range orderIDs {
-		rows = append(rows, fmt.Sprintf("($%d, $%d, NOW(), %d)", argIdx, argIdx+1, split))
-		args = append(args, orderID, terminalStatus)
-		argIdx += 2
+		allArgs = append(allArgs, orderID, terminalStatus, split)
 	}
-
-	return batchInsertRaw(db,
-		fmt.Sprintf("INSERT INTO order_status_events_%s_%d (order_id, status, event_time, city_split) VALUES ", city, split),
-		rows, args)
+	return batchInsert(db,
+		fmt.Sprintf("INSERT INTO order_status_events_%s_%d (order_id, status, city_split) VALUES", city, split),
+		3, allArgs)
 }
 
 func seedDeliveryAssignments(db *sql.DB, brandName, city string, split int, orderIDs []int64) error {
 	if len(orderIDs) == 0 {
 		return nil
 	}
-
-	var rows []string
-	var args []interface{}
-	argIdx := 1
-
+	var allArgs []interface{}
 	for _, orderID := range orderIDs {
 		if rand.Float64() < 0.10 {
 			continue
 		}
-
 		assignedAt := randomTimestamp(2023, 2025)
 		completedAt := randomTimestamp(2023, 2025)
-
+		var agentID int64
 		switch brandName {
 		case "zomato_food", "blinkit":
-			rows = append(rows, fmt.Sprintf("($%d, $%d, $%d, $%d, %d)", argIdx, argIdx+1, argIdx+2, argIdx+3, split))
-			args = append(args, orderID, rand.Int63n(5000)+1, assignedAt, completedAt)
-			argIdx += 4
+			agentID = rand.Int63n(5000) + 1
 		case "hyperpure":
-			rows = append(rows, fmt.Sprintf("($%d, $%d, $%d, $%d, %d)", argIdx, argIdx+1, argIdx+2, argIdx+3, split))
-			args = append(args, orderID, rand.Int63n(500)+1, assignedAt, completedAt)
-			argIdx += 4
+			agentID = rand.Int63n(500) + 1
 		case "district":
-			rows = append(rows, fmt.Sprintf("($%d, $%d, $%d, $%d, %d)", argIdx, argIdx+1, argIdx+2, argIdx+3, split))
-			args = append(args, orderID, rand.Int63n(100)+1, assignedAt, completedAt)
-			argIdx += 4
+			agentID = rand.Int63n(100) + 1
 		}
+		allArgs = append(allArgs, orderID, agentID, assignedAt, completedAt, split)
 	}
-
-	if len(rows) == 0 {
+	if len(allArgs) == 0 {
 		return nil
 	}
-
 	var colsDef string
 	switch brandName {
 	case "zomato_food", "blinkit":
@@ -444,10 +418,9 @@ func seedDeliveryAssignments(db *sql.DB, brandName, city string, split int, orde
 	case "district":
 		colsDef = "order_id, gate_id, scanned_at, attended_at, city_split"
 	}
-
-	return batchInsertRaw(db,
-		fmt.Sprintf("INSERT INTO delivery_assignments_%s_%d (%s) VALUES ", city, split, colsDef),
-		rows, args)
+	return batchInsert(db,
+		fmt.Sprintf("INSERT INTO delivery_assignments_%s_%d (%s) VALUES", city, split, colsDef),
+		5, allArgs)
 }
 
 func createNextSplitTables(db *sql.DB, brandName, city string, splitNum int) error {
@@ -570,18 +543,30 @@ CREATE TABLE IF NOT EXISTS %s (
 );`, tbl, cols)
 }
 
-func batchInsertRaw(db *sql.DB, prefix string, rows []string, args []interface{}) error {
-	if len(rows) == 0 {
+// batchInsert inserts allArgs in chunks, building fresh $1..$N placeholder numbering
+// per chunk so Postgres always receives correctly numbered parameters.
+func batchInsert(db *sql.DB, prefix string, argsPerRow int, allArgs []interface{}) error {
+	if len(allArgs) == 0 {
 		return nil
 	}
-	argsPerRow := len(args) / len(rows)
-	for start := 0; start < len(rows); start += insertBatchSize {
+	totalRows := len(allArgs) / argsPerRow
+	for start := 0; start < totalRows; start += insertBatchSize {
 		end := start + insertBatchSize
-		if end > len(rows) {
-			end = len(rows)
+		if end > totalRows {
+			end = totalRows
 		}
-		chunkArgs := args[start*argsPerRow : end*argsPerRow]
-		query := prefix + strings.Join(rows[start:end], ", ") + " ON CONFLICT DO NOTHING"
+		var rowPHs []string
+		argIdx := 1
+		for r := 0; r < end-start; r++ {
+			var cols []string
+			for p := 0; p < argsPerRow; p++ {
+				cols = append(cols, fmt.Sprintf("$%d", argIdx))
+				argIdx++
+			}
+			rowPHs = append(rowPHs, "("+strings.Join(cols, ", ")+")")
+		}
+		chunkArgs := allArgs[start*argsPerRow : end*argsPerRow]
+		query := prefix + " " + strings.Join(rowPHs, ", ") + " ON CONFLICT DO NOTHING"
 		if _, err := db.Exec(query, chunkArgs...); err != nil {
 			return err
 		}

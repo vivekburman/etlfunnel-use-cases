@@ -83,10 +83,7 @@ func enableWAL(brand brands.Brand, auxDB *sql.DB) error {
 	}
 
 	if !pubExists {
-		_, err = db.Exec(fmt.Sprintf(
-			`CREATE PUBLICATION %s FOR TABLE orders_*, order_items_*, order_status_events_*, delivery_assignments_*`,
-			pubName,
-		))
+		_, err = db.Exec(fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, pubName))
 		if err != nil {
 			return fmt.Errorf("create publication: %w", err)
 		}
