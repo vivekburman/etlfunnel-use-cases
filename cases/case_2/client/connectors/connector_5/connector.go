@@ -49,7 +49,7 @@ func ReadBatch(ctx context.Context, redisClient models.IRedisClient, props *mode
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "NOGROUP") {
-			return nil, fmt.Errorf("connector_5(%s): consumer group %q not found — run orchestrator_2 first", Brand, consumerGroup)
+			return nil, fmt.Errorf("connector_5(%s): consumer group %q not found — ensure it is created before starting the hot flow", Brand, consumerGroup)
 		}
 		if isTimeout(err) {
 			return nil, nil

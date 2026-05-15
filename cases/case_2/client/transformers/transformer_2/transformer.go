@@ -16,29 +16,25 @@ package client_transformer_2
 // Records belonging to other brands are passed through unchanged.
 
 import (
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
 )
 
 const targetBrand = "zomato_food"
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	out := make([]map[string]any, 0, len(param.Records))
-	for _, rec := range param.Records {
-		if brand, _ := rec["sub_brand"].(string); brand != targetBrand {
-			out = append(out, rec)
-			continue
-		}
-		out = append(out, mapRecord(rec))
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	if brand, _ := param.Record["sub_brand"].(string); brand != targetBrand {
+		return param.Record, nil
 	}
-	return &models.TransformerTune{Action: models.ActionContinue, Records: out}, nil
+	return mapRecord(param.Record), nil
 }
 
 func mapRecord(src map[string]any) map[string]any {
-	r := shallowClone(src)
+	r := ulib.ShallowClone(src)
 
-	move(r, "restaurant_id", "fulfilment_source_id")
-	move(r, "cuisine_type", "catalogue_label")
-	move(r, "meal_type", "order_subtype")
+	ulib.MoveKey(r, "restaurant_id", "fulfilment_source_id")
+	ulib.MoveKey(r, "cuisine_type", "catalogue_label")
+	ulib.MoveKey(r, "meal_type", "order_subtype")
 
 	// prep_time_secs → promised_minutes (integer, rounded down)
 	if v, ok := r["prep_time_secs"]; ok {
@@ -57,14 +53,6 @@ func mapRecord(src map[string]any) map[string]any {
 	return r
 }
 
-// move renames src[from] → src[to] and deletes the old key.
-func move(r map[string]any, from, to string) {
-	if v, ok := r[from]; ok {
-		r[to] = v
-		delete(r, from)
-	}
-}
-
 func toMinutesFromSecs(v any) int64 {
 	switch n := v.(type) {
 	case int64:
@@ -77,10 +65,3 @@ func toMinutesFromSecs(v any) int64 {
 	return 0
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}

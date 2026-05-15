@@ -18,11 +18,14 @@ import (
 )
 
 var (
-	flagAuxDSN  = flag.String("auxdb", "host=localhost port=5445 dbname=auxdb user=etl_user password=etl_pass sslmode=disable", "AuxDB connection string")
-	flagES      = flag.String("es", "http://localhost:9200", "Elasticsearch base URL")
-	flagRedis   = flag.String("redis", "localhost:6379", "Redis address")
-	flagInterval = flag.Duration("interval", 5*time.Second, "Poll interval")
-	flagLogFile  = flag.String("log", "", "Path to write output (file is cleared each run)")
+	flagAuxDSN    = flag.String("auxdb", "host=localhost port=5445 dbname=auxdb user=etl_user password=etl_pass sslmode=disable", "AuxDB connection string")
+	flagES        = flag.String("es", "http://localhost:9200", "Elasticsearch base URL")
+	flagESUser    = flag.String("es-user", "elastic", "Elasticsearch username")
+	flagESPass    = flag.String("es-pass", "etl_pass", "Elasticsearch password")
+	flagRedis     = flag.String("redis", "localhost:6379", "Redis address")
+	flagRedisPass = flag.String("redis-pass", "etl_pass", "Redis password")
+	flagInterval  = flag.Duration("interval", 5*time.Second, "Poll interval")
+	flagLogFile   = flag.String("log", "", "Path to write output (file is cleared each run)")
 )
 
 var out io.Writer = os.Stdout
@@ -54,7 +57,10 @@ func main() {
 	auxConn := mustConnectPG(ctx, *flagAuxDSN, "AuxDB")
 	defer auxConn.Close(context.Background())
 
-	rdb := redis.NewClient(&redis.Options{Addr: *flagRedis})
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     *flagRedis,
+		Password: *flagRedisPass,
+	})
 	defer rdb.Close()
 
 	fmt.Fprintln(out, "Zomato Platform Order Intelligence — Metrics Watcher started.")
@@ -87,7 +93,7 @@ func printDashboard(ctx context.Context, aux *pgx.Conn, rdb *redis.Client, tick 
 	printColdCheckpoints(ctx, aux, tick, prevRecords)
 	printBackfillCompletion(ctx, aux)
 	printHotStreamLag(ctx, rdb)
-	printESDocCounts(*flagES)
+	printESDocCounts(*flagES, *flagESUser, *flagESPass)
 	printBacklogSummary(ctx, aux)
 	printWriteTuneConfig(ctx, aux)
 	printESWriteLog(ctx, aux)
@@ -165,11 +171,24 @@ func printHotStreamLag(ctx context.Context, rdb *redis.Client) {
 	}
 }
 
-func printESDocCounts(base string) {
+// esRequest performs an authenticated HTTP request against Elasticsearch.
+func esRequest(method, url, user, pass string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(user, pass)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return http.DefaultClient.Do(req)
+}
+
+func printESDocCounts(base, esUser, esPass string) {
 	fmt.Fprintln(out, "\n  ELASTICSEARCH DOC COUNTS")
 
 	// Total count
-	resp, err := http.Get(fmt.Sprintf("%s/platform_orders/_count", base))
+	resp, err := esRequest(http.MethodGet, fmt.Sprintf("%s/platform_orders/_count", base), esUser, esPass, nil)
 	if err != nil {
 		fmt.Fprintf(out, "  [warn] ES count: %v\n", err)
 		return
@@ -185,7 +204,7 @@ func printESDocCounts(base string) {
 
 	// Agg by sub_brand
 	aggReq := `{"size":0,"aggs":{"by_brand":{"terms":{"field":"sub_brand","size":10}}}}`
-	aggResp, err := http.Post(fmt.Sprintf("%s/platform_orders/_search", base), "application/json", strings.NewReader(aggReq))
+	aggResp, err := esRequest(http.MethodPost, fmt.Sprintf("%s/platform_orders/_search", base), esUser, esPass, strings.NewReader(aggReq))
 	if err != nil {
 		fmt.Fprintf(out, "  [warn] ES agg: %v\n", err)
 		return

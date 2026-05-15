@@ -22,17 +22,14 @@ package client_transformer_11
 // seeder — they should not block indexing).
 
 import (
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
 )
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	out := make([]map[string]any, 0, len(param.Records))
-	for _, rec := range param.Records {
-		r := shallowClone(rec)
-		r["order_value_band"] = band(r)
-		out = append(out, r)
-	}
-	return &models.TransformerTune{Action: models.ActionContinue, Records: out}, nil
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	r := ulib.ShallowClone(param.Record)
+	r["order_value_band"] = band(r)
+	return r, nil
 }
 
 func band(r map[string]any) string {
@@ -68,10 +65,3 @@ func toFloat64(v any) float64 {
 	return 0
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}

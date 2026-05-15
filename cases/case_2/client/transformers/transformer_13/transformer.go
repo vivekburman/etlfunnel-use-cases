@@ -32,19 +32,14 @@ import (
 	"time"
 )
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
 	flowType := deriveFlowType(param.State.GetFlowName())
 	indexedAt := time.Now().UTC().Format(time.RFC3339)
 
-	out := make([]map[string]any, 0, len(param.Records))
-	for _, rec := range param.Records {
-		cast := castRecord(rec, param.State.GetLogger())
-		cast["flow_type"] = flowType
-		cast["indexed_at"] = indexedAt
-		out = append(out, cast)
-	}
-
-	return &models.TransformerTune{Action: models.ActionContinue, Records: out}, nil
+	cast := castRecord(param.Record, param.State.GetLogger())
+	cast["flow_type"] = flowType
+	cast["indexed_at"] = indexedAt
+	return cast, nil
 }
 
 // castRecord returns a new map with all values converted to ES-compatible types.

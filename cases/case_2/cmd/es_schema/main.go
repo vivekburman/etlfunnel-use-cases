@@ -10,7 +10,11 @@ import (
 	"net/http"
 )
 
-var flagES = flag.String("es", "http://localhost:9200", "Elasticsearch base URL")
+var (
+	flagES     = flag.String("es", "http://localhost:9200", "Elasticsearch base URL")
+	flagESUser = flag.String("es-user", "elastic", "Elasticsearch username")
+	flagESPass = flag.String("es-pass", "etl_pass", "Elasticsearch password")
+)
 
 const indexName = "platform_orders"
 
@@ -18,7 +22,7 @@ func main() {
 	flag.Parse()
 	log.Println("=== Elasticsearch Schema Creator ===")
 
-	exists, err := indexExists(*flagES, indexName)
+	exists, err := indexExists(*flagES, *flagESUser, *flagESPass, indexName)
 	if err != nil {
 		log.Fatalf("[es] checking index existence: %v", err)
 	}
@@ -28,15 +32,28 @@ func main() {
 		return
 	}
 
-	if err := createIndex(*flagES, indexName); err != nil {
+	if err := createIndex(*flagES, *flagESUser, *flagESPass, indexName); err != nil {
 		log.Fatalf("[es] create index: %v", err)
 	}
 	log.Printf("[es] index %q created", indexName)
 	log.Println("=== ES schema setup complete ===")
 }
 
-func indexExists(base, name string) (bool, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/%s", base, name))
+// esRequest performs an authenticated HTTP request against Elasticsearch.
+func esRequest(method, url, user, pass string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(user, pass)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return http.DefaultClient.Do(req)
+}
+
+func indexExists(base, user, pass, name string) (bool, error) {
+	resp, err := esRequest(http.MethodGet, fmt.Sprintf("%s/%s", base, name), user, pass, nil)
 	if err != nil {
 		return false, err
 	}
@@ -51,7 +68,7 @@ func indexExists(base, name string) (bool, error) {
 	return false, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 }
 
-func createIndex(base, name string) error {
+func createIndex(base, user, pass, name string) error {
 	payload := map[string]interface{}{
 		"settings": map[string]interface{}{
 			"number_of_shards":   5,
@@ -91,13 +108,7 @@ func createIndex(base, name string) error {
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/%s", base, name), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := esRequest(http.MethodPut, fmt.Sprintf("%s/%s", base, name), user, pass, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

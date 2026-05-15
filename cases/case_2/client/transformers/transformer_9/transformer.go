@@ -99,40 +99,21 @@ func loadCache(param *models.TransformerProps) map[int]cityEntry {
 	return cityCache
 }
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
 	cache := loadCache(param)
 
-	var good []map[string]any
-	var failed []map[string]any
-
-	for _, rec := range param.Records {
-		cityID := toCityID(rec["city_id"])
-		entry, ok := cache[cityID]
-		if !ok {
-			r := shallowClone(rec)
-			r["_failure_stage"] = "Transform"
-			r["_error_code"] = "UNKNOWN_CITY"
-			r["_error_msg"] = fmt.Sprintf("no city mapping for city_id=%d", cityID)
-			failed = append(failed, r)
-			continue
-		}
-
-		r := shallowClone(rec)
-		r["city_name"] = entry.name
-		r["zone_label"] = entry.zoneLabel
-		r["state"] = entry.state
-		r["tier"] = entry.tier
-		good = append(good, r)
+	cityID := toCityID(param.Record["city_id"])
+	entry, ok := cache[cityID]
+	if !ok {
+		return nil, fmt.Errorf("UNKNOWN_CITY: no city mapping for city_id=%d", cityID)
 	}
 
-	if len(failed) > 0 {
-		param.State.GetLogger().Warn(
-			fmt.Sprintf("transformer_9: %d record(s) with unknown city_id routed to backlog", len(failed)),
-		)
-		param.BacklogFn(failed)
-	}
-
-	return &models.TransformerTune{Action: models.ActionContinue, Records: good}, nil
+	r := ulib.ShallowClone(param.Record)
+	r["city_name"] = entry.name
+	r["zone_label"] = entry.zoneLabel
+	r["state"] = entry.state
+	r["tier"] = entry.tier
+	return r, nil
 }
 
 func toCityID(v any) int {
@@ -147,10 +128,3 @@ func toCityID(v any) int {
 	return -1
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}

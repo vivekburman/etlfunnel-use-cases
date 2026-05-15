@@ -78,3 +78,21 @@ func ExtractFailureStageLabel(record map[string]any, fallback string) string {
 func IsNoRows(err error) bool {
 	return err != nil && err.Error() == "no rows in result set"
 }
+
+// ShallowClone returns a shallow copy of a record map.
+func ShallowClone(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// MoveKey renames r[from] to r[to] and deletes the old key.
+// No-op if from is absent.
+func MoveKey(r map[string]any, from, to string) {
+	if v, ok := r[from]; ok {
+		r[to] = v
+		delete(r, from)
+	}
+}

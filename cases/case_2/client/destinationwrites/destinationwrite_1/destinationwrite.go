@@ -68,9 +68,8 @@ type writeTuneConfig struct {
 	MaxConcurrentPipelines       int
 }
 
-// Tune reads the current write config and returns batch size and mode adjustments.
-func Tune(ctx context.Context, param *models.DestinationWriteProps) (*models.DestinationWriteTune, error) {
-	cfg, err := loadConfig(ctx, param)
+func DestinationWriteRule(param *models.DestinationWriteProps) (*models.DestinationWriteTune, error) {
+	cfg, err := loadConfig(param)
 	if err != nil {
 		param.State.GetLogger().Warn(fmt.Sprintf("destinationwrite_1: config load failed (%v) — keeping current tune", err))
 		return defaultTune(), nil
@@ -163,14 +162,14 @@ func defaultTune() *models.DestinationWriteTune {
 
 // ── AuxDB config loader ──────────────────────────────────────────────────────
 
-func loadConfig(ctx context.Context, param *models.DestinationWriteProps) (*writeTuneConfig, error) {
+func loadConfig(param *models.DestinationWriteProps) (*writeTuneConfig, error) {
 	pgConn, err := ulib.GetAuxPostgresConn(param.AuxiliaryDBConnMap)
 	if err != nil {
 		return nil, err
 	}
 
 	var cfg writeTuneConfig
-	err = pgConn.QueryRow(ctx, `
+	err = pgConn.QueryRow(context.Background(), `
 		SELECT batch_size_normal, batch_size_turbo, batch_size_throttle,
 		       throttle_schedule, redis_xread_count_slowify,
 		       destination_latency_threshold_ms,

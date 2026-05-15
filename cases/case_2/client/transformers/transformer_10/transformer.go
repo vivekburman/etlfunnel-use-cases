@@ -20,6 +20,7 @@ package client_transformer_10
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
 	"fmt"
 )
@@ -27,16 +28,12 @@ import (
 // piiFields are removed from the record entirely.
 var piiFields = []string{"phone", "email", "address"}
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	out := make([]map[string]any, 0, len(param.Records))
-	for _, rec := range param.Records {
-		out = append(out, mask(rec))
-	}
-	return &models.TransformerTune{Action: models.ActionContinue, Records: out}, nil
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	return mask(param.Record), nil
 }
 
 func mask(src map[string]any) map[string]any {
-	r := shallowClone(src)
+	r := ulib.ShallowClone(src)
 
 	// Hash customer_id → customer_id_hash.
 	if raw, ok := r["customer_id"]; ok {
@@ -76,10 +73,3 @@ func isHex(s string) bool {
 	return true
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}

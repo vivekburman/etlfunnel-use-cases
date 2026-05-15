@@ -21,18 +21,14 @@ package client_transformer_8
 //   meal_period is left unset so TypeCaster omits it from the ES document.
 
 import (
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
-	"time"
 )
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	out := make([]map[string]any, 0, len(param.Records))
-	for _, rec := range param.Records {
-		r := shallowClone(rec)
-		bucket(r)
-		out = append(out, r)
-	}
-	return &models.TransformerTune{Action: models.ActionContinue, Records: out}, nil
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	r := ulib.ShallowClone(param.Record)
+	bucket(r)
+	return r, nil
 }
 
 func bucket(r map[string]any) {
@@ -45,7 +41,7 @@ func bucket(r map[string]any) {
 		return
 	}
 
-	placedAt, ok := toTime(r["placed_at"])
+	placedAt, ok := ulib.ToTime(r["placed_at"])
 	if !ok {
 		r["meal_period"] = "unknown"
 		return
@@ -69,35 +65,3 @@ func mealPeriod(hour int) string {
 	}
 }
 
-func toTime(v any) (time.Time, bool) {
-	switch t := v.(type) {
-	case time.Time:
-		if t.IsZero() {
-			return time.Time{}, false
-		}
-		return t, true
-	case *time.Time:
-		if t == nil || t.IsZero() {
-			return time.Time{}, false
-		}
-		return *t, true
-	case string:
-		if t == "" {
-			return time.Time{}, false
-		}
-		parsed, err := time.Parse(time.RFC3339, t)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return parsed, true
-	}
-	return time.Time{}, false
-}
-
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}

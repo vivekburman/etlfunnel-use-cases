@@ -30,18 +30,14 @@ package client_transformer_7
 //   sla_status      — the verdict string
 
 import (
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
-	"time"
 )
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	out := make([]map[string]any, 0, len(param.Records))
-	for _, rec := range param.Records {
-		r := shallowClone(rec)
-		computeSLA(r)
-		out = append(out, r)
-	}
-	return &models.TransformerTune{Action: models.ActionContinue, Records: out}, nil
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	r := ulib.ShallowClone(param.Record)
+	computeSLA(r)
+	return r, nil
 }
 
 func computeSLA(r map[string]any) {
@@ -61,8 +57,8 @@ func computeSLA(r map[string]any) {
 // computeTimestampSLA handles the delivery / quick-commerce SLA model.
 // writeActualMinutes: if true, also writes actual_minutes to the record.
 func computeTimestampSLA(r map[string]any, writeActualMinutes bool) {
-	placedAt, okPlaced := toTime(r["placed_at"])
-	slaAnchor, okAnchor := toTime(r["sla_anchor"])
+	placedAt, okPlaced := ulib.ToTime(r["placed_at"])
+	slaAnchor, okAnchor := ulib.ToTime(r["sla_anchor"])
 	promised := toInt64(r["promised_minutes"])
 
 	if !okPlaced || !okAnchor {
@@ -101,7 +97,7 @@ func computeDistrictSLA(r map[string]any) {
 	}
 
 	// For completed events, attended_at must be present.
-	if _, ok := toTime(r["completed_at"]); ok {
+	if _, ok := ulib.ToTime(r["completed_at"]); ok {
 		r["sla_status"] = "met"
 		return
 	}
@@ -112,33 +108,6 @@ func computeDistrictSLA(r map[string]any) {
 
 func isNoShow(status string) bool {
 	return status == "NO_SHOW" || status == "no_show"
-}
-
-// toTime attempts to read a time.Time from a map value.
-// Accepts time.Time directly or an RFC3339/ISO8601 string.
-func toTime(v any) (time.Time, bool) {
-	switch t := v.(type) {
-	case time.Time:
-		if t.IsZero() {
-			return time.Time{}, false
-		}
-		return t, true
-	case *time.Time:
-		if t == nil || t.IsZero() {
-			return time.Time{}, false
-		}
-		return *t, true
-	case string:
-		if t == "" {
-			return time.Time{}, false
-		}
-		parsed, err := time.Parse(time.RFC3339, t)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return parsed, true
-	}
-	return time.Time{}, false
 }
 
 func toInt64(v any) int64 {
@@ -153,10 +122,3 @@ func toInt64(v any) int64 {
 	return 0
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}

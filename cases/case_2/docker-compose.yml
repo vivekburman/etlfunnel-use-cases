@@ -149,6 +149,7 @@ services:
     image: redis:7-alpine
     container_name: redis
     restart: unless-stopped
+    command: redis-server --requirepass etl_pass
     ports:
       - "6379:6379"
     volumes:
@@ -156,7 +157,7 @@ services:
     networks:
       - zomato_net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "etl_pass", "ping"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -168,7 +169,8 @@ services:
     restart: unless-stopped
     environment:
       - discovery.type=single-node
-      - xpack.security.enabled=false
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=etl_pass
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
       - "9200:9200"
@@ -177,7 +179,7 @@ services:
     networks:
       - zomato_net
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f -u elastic:etl_pass http://localhost:9200/_cluster/health || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10

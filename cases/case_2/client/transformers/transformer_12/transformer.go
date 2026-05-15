@@ -24,6 +24,7 @@ package client_transformer_12
 // Non-cancelled records get cancellation_stage = "na".
 
 import (
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
 	"strings"
 )
@@ -48,14 +49,10 @@ var districtTicketIssuedStatuses = map[string]bool{
 	"ticket_issued": true,
 }
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	out := make([]map[string]any, 0, len(param.Records))
-	for _, rec := range param.Records {
-		r := shallowClone(rec)
-		classify(r)
-		out = append(out, r)
-	}
-	return &models.TransformerTune{Action: models.ActionContinue, Records: out}, nil
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	r := ulib.ShallowClone(param.Record)
+	classify(r)
+	return r, nil
 }
 
 func classify(r map[string]any) {
@@ -139,10 +136,3 @@ func statusFromEvent(e map[string]any) string {
 	return ""
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}

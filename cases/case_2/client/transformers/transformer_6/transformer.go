@@ -21,7 +21,9 @@ package client_transformer_6
 // UNKNOWN_STATUS and removed from the downstream batch.
 
 import (
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
+	"fmt"
 	"strings"
 )
 
@@ -61,57 +63,18 @@ var statusMap = map[string]string{
 	"district|no_show":              "cancelled",
 }
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	var good []map[string]any
-	var failed []map[string]any
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	brand, _ := param.Record["sub_brand"].(string)
+	rawStatus, _ := param.Record["order_status"].(string)
 
-	for _, rec := range param.Records {
-		brand, _ := rec["sub_brand"].(string)
-		rawStatus, _ := rec["order_status"].(string)
-
-		key := strings.ToLower(brand) + "|" + strings.ToLower(rawStatus)
-		canonical, ok := statusMap[key]
-		if !ok {
-			rec["_failure_stage"] = "Transform"
-			rec["_error_code"] = "UNKNOWN_STATUS"
-			rec["_error_msg"] = "unmapped status: " + rawStatus + " for brand: " + brand
-			failed = append(failed, rec)
-			continue
-		}
-
-		r := shallowClone(rec)
-		r["canonical_status"] = canonical
-		good = append(good, r)
+	key := strings.ToLower(brand) + "|" + strings.ToLower(rawStatus)
+	canonical, ok := statusMap[key]
+	if !ok {
+		return nil, fmt.Errorf("UNKNOWN_STATUS: unmapped status %q for brand %q", rawStatus, brand)
 	}
 
-	if len(failed) > 0 {
-		param.State.GetLogger().Warn(
-			"transformer_6: " + itoa(len(failed)) + " record(s) with unknown status routed to backlog",
-		)
-		param.BacklogFn(failed)
-	}
-
-	return &models.TransformerTune{Action: models.ActionContinue, Records: good}, nil
+	r := ulib.ShallowClone(param.Record)
+	r["canonical_status"] = canonical
+	return r, nil
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	buf := [20]byte{}
-	pos := len(buf)
-	for n > 0 {
-		pos--
-		buf[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[pos:])
-}

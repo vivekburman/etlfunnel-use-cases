@@ -114,8 +114,6 @@ orders_mumbai_1, orders_mumbai_2 ...
 
 The `orchestrator_1` (cold flow) discovers all city splits for a given brand entity via `information_schema.tables` — identical to Case 1's dynamic table discovery pattern.
 
-The `orchestrator_2` (hot flow) discovers the replication slot and Redis stream for a given brand and registers consumers for each city's event stream.
-
 ---
 
 ## Part 2 — ETL Pipeline Components
@@ -451,11 +449,6 @@ Hot iso-entities 21–32 cover blinkit, hyperpure, district hot flows.
 - Returns one `PipelineOrchestratorTune` per discovered table split
 - Same pattern as Case 1's cold flow orchestrator
 
-**orchestrator_2 (Hot Flow — Redis stream & consumer registration):**
-- Verifies Redis stream exists and consumer group `elastic_writer_group` is registered (`XGROUP CREATE ... MKSTREAM`)
-- Returns one `PipelineOrchestratorTune` per brand stream
-- Reads last acknowledged stream ID from AuxDB `pipeline_checkpoints` for resume
-
 ### 4.4 Peak Parallelism Model
 
 ```
@@ -504,7 +497,6 @@ In practice, `DestinationWriteTune` slowify caps concurrency during peak hours t
 
 - [ ] **STEP-14** — Implement hot flow source iso-entities (`iso_entity_17` through `iso_entity_32`) — 4 entities × 4 brands = 16 packages. Each reads from its brand's Redis stream via `XREADGROUP`. Returns decoded JSON messages as `map[string]any`. Filters by the `table` field in the stream message to isolate entity-specific events.
 - [ ] **STEP-15** — Implement Redis producer processes (one per brand) as part of `cmd/hot_flow/main.go`. Each producer: connects to the brand's Postgres logical replication slot, decodes `pgoutput` change events, publishes to the brand's Redis stream with the message format defined in §2.6. Handles reconnection on slot disconnect.
-- [ ] **STEP-16** — Implement `orchestrator_2` — registers the consumer group in Redis (`XGROUP CREATE ... MKSTREAM`), reads the last stream ID from AuxDB checkpoint, and returns `PipelineOrchestratorTune` for each brand stream.
 
 ### Phase 5 — Transformer Chain
 

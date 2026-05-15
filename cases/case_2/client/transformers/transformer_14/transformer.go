@@ -33,39 +33,26 @@ package client_transformer_14
 
 import (
 	"encoding/json"
+	ulib "etlfunnel/execution/client/userlibraries"
 	"etlfunnel/execution/models"
 	"fmt"
 )
 
-func Transform(param *models.TransformerProps) (*models.TransformerTune, error) {
-	var good []map[string]any
-	var backlogged []map[string]any
+func Transformer(param *models.TransformerProps) (map[string]any, error) {
+	rec := param.Record
 
-	for _, rec := range param.Records {
-		// If the record has no "op" key it has already been unwrapped
-		// (e.g. backlog retry re-entered this transformer). Pass through.
-		if _, hasOp := rec["op"]; !hasOp {
-			good = append(good, rec)
-			continue
-		}
-
-		unwrapped, action := unwrap(rec)
-		switch action {
-		case actionForward:
-			good = append(good, unwrapped)
-		case actionBacklog:
-			backlogged = append(backlogged, unwrapped)
-		}
+	// If the record has no "op" key it has already been unwrapped
+	// (e.g. backlog retry re-entered this transformer). Pass through.
+	if _, hasOp := rec["op"]; !hasOp {
+		return rec, nil
 	}
 
-	if len(backlogged) > 0 {
-		param.State.GetLogger().Warn(
-			fmt.Sprintf("transformer_14: %d WAL event(s) routed to backlog", len(backlogged)),
-		)
-		param.BacklogFn(backlogged)
+	unwrapped, action := unwrap(rec)
+	if action == actionBacklog {
+		return nil, fmt.Errorf("WAL event backlogged: stage=%v code=%v msg=%v",
+			unwrapped["_failure_stage"], unwrapped["_error_code"], unwrapped["_error_msg"])
 	}
-
-	return &models.TransformerTune{Action: models.ActionContinue, Records: good}, nil
+	return unwrapped, nil
 }
 
 type unwrapAction int
@@ -97,7 +84,7 @@ func unwrap(envelope map[string]any) (map[string]any, unwrapAction) {
 			return tombstone, actionBacklog
 		}
 
-		r := shallowClone(after)
+		r := ulib.ShallowClone(after)
 		r["_wal_op"] = op
 		r["_wal_table"] = table
 		r["_wal_lsn"] = lsn
@@ -159,10 +146,3 @@ func rawJSON(v any) string {
 	return string(b)
 }
 
-func shallowClone(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
