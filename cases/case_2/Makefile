@@ -14,7 +14,7 @@
 #   make setup        — run ALL of the above in order (full bootstrap)
 #   make down         — stop and remove containers (keeps volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
-#   make clean-migration — wipe AuxDB state for a fresh pipeline re-run
+#   make clean-migration — wipe AuxDB state + ES documents for a fresh pipeline re-run
 #   make logs         — tail all container logs
 #   make status       — show container health
 #   make watch        — start the live metrics watcher (polls until Ctrl+C)
@@ -120,12 +120,19 @@ setup: up pg-schema es-schema auxdb wal-enable seed
 	@echo "  Credentials: user=etl_user  password=etl_pass"
 	@echo "============================================"
 
-## Wipe AuxDB migration state for a fresh pipeline re-run
+## Wipe AuxDB migration state + ES documents for a fresh pipeline re-run
 clean-migration:
-	@echo ">>> Clearing AuxDB migration state tables..."
+	@echo ">>> [1/2] Clearing AuxDB migration state tables..."
 	@docker exec -e PGPASSWORD=etl_pass auxdb \
 		psql -U etl_user -d auxdb -c \
 		"TRUNCATE pipeline_checkpoints, backlog_records, wal_positions, backfill_progress, backfill_completion_log, es_write_log RESTART IDENTITY CASCADE;"
+	@echo ">>> [2/2] Deleting all documents from Elasticsearch index 'platform_orders'..."
+	@curl -s -o /dev/null -w "    ES delete-by-query: HTTP %{http_code}\n" \
+		-u elastic:etl_pass \
+		-X POST "$(ES_URL)/platform_orders/_delete_by_query?refresh=true&conflicts=proceed" \
+		-H 'Content-Type: application/json' \
+		-d '{"query":{"match_all":{}}}' \
+	|| echo "    (skipped — ES may be down or index does not exist yet)"
 	@echo ""
 	@echo "============================================"
 	@echo "  Migration state cleared — ready to re-run"
@@ -133,6 +140,7 @@ clean-migration:
 	@echo "  AuxDB cleared  : pipeline_checkpoints, backlog_records, wal_positions,"
 	@echo "                   backfill_progress, backfill_completion_log, es_write_log"
 	@echo "  AuxDB preserved: city_mapping, brand_sla_rules, terminate_rules, write_tune_config"
+	@echo "  ES cleared     : all documents in platform_orders (index + mapping preserved)"
 	@echo "  Source DBs     : untouched (Postgres order data intact)"
 	@echo "============================================"
 
