@@ -4,7 +4,7 @@
 #
 # USAGE:
 #   make up           — start all 7 Docker containers
-#   make deps         — download Go module dependencies
+#   make deps         — download Go module dependencies (also runs go mod tidy)
 #   make pg-schema    — create Postgres schemas on all 4 source DBs
 #   make es-schema    — create Elasticsearch platform_orders index
 #   make auxdb        — create AuxDB schemas + seed reference data
@@ -19,6 +19,21 @@
 #   make status       — show container health
 #   make watch        — start the live metrics watcher (polls until Ctrl+C)
 #                       Override: make watch INTERVAL=10s
+#
+# HOT PIPELINE (live Postgres writer — makes WAL pile up for the ETL to consume):
+#   make hot          — start the live order generator (runs until Ctrl+C)
+#                       Continuously inserts synthetic orders into all 4 brand DBs
+#                       so WAL events accumulate in the replication slots.
+#                       The separate ETL pipeline reads those slots → Redis → ES.
+#                       Override: make hot BATCH=200 HOT_INTERVAL=5s
+#   make hot-clean    — flush all 4 Redis streams + clear hot-flow AuxDB checkpoints
+#                       (leaves source Postgres data and WAL slots untouched)
+#   make wal-reset    — drop & recreate WAL replication slots on all 4 source DBs
+#                       (slots are re-positioned at current LSN; use before hot-restart)
+#   make hot-restart  — clean replay from a fresh dump:
+#                       hot-clean → wal-reset → seed → hot
+#                       Drops/recreates slots, re-seeds source data (fresh WAL capture),
+#                       then starts the live order generator.
 
 SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -euo pipefail -c
@@ -34,7 +49,7 @@ REDIS_ADDR ?= localhost:6379
 INTERVAL   ?= 5s
 WATCH_LOG  ?= metrics.log
 
-.PHONY: up down reset clean-migration deps pg-schema es-schema auxdb wal-enable seed seed-scale setup logs status wait-healthy watch
+.PHONY: up down reset clean-migration deps pg-schema es-schema auxdb wal-enable seed seed-scale setup logs status wait-healthy watch hot hot-clean wal-reset hot-restart
 
 ## Start all 7 containers
 up:
@@ -169,3 +184,69 @@ watch:
 		--redis   "$(REDIS_ADDR)" \
 		--interval $(INTERVAL) \
 		--log     $(WATCH_LOG)
+
+# ── Hot Pipeline ─────────────────────────────────────────────────────────────
+# Prereq: make setup must have completed (containers healthy, schemas created,
+#         WAL slots established, source data seeded) before running these.
+
+## hot — continuously insert live orders into all 4 brand DBs (WAL accumulates for ETL).
+## Runs until Ctrl+C.  Override batch size and interval:
+##   make hot BATCH=200 HOT_INTERVAL=5s
+BATCH        ?= 50
+HOT_INTERVAL ?= 2s
+hot: deps
+	@echo ">>> Starting live order generator (batch=$(BATCH) interval=$(HOT_INTERVAL))..."
+	go run ./cmd/hot_pipeline \
+		--batch    $(BATCH) \
+		--interval $(HOT_INTERVAL)
+
+## hot-clean — flush the 4 Redis streams + clear hot-flow AuxDB checkpoints.
+## Leaves source Postgres tables and WAL slots completely untouched.
+hot-clean:
+	@echo ">>> [1/2] Deleting Redis hot streams..."
+	@docker exec redis redis-cli -a etl_pass --no-auth-warning DEL \
+		zomato:orders:stream \
+		blinkit:orders:stream \
+		hyperpure:orders:stream \
+		district:orders:stream \
+		| xargs -I{} echo "    Redis streams removed: {} key(s)"
+	@echo ">>> [2/2] Clearing hot-flow checkpoints from AuxDB..."
+	@docker exec -e PGPASSWORD=etl_pass auxdb \
+		psql -U etl_user -d auxdb -c \
+		"DELETE FROM pipeline_checkpoints WHERE flow_type = 'hot'; \
+		 DELETE FROM es_write_log       WHERE flow_type = 'hot';"
+	@echo ">>> Hot pipeline state cleared"
+
+## wal-reset — drop & recreate logical replication slots on all 4 source DBs
+## so the next hot run captures a fresh batch of data from the current LSN.
+wal-reset:
+	@echo ">>> Dropping existing replication slots..."
+	@docker exec -e PGPASSWORD=etl_pass zomato_food_db \
+		psql -U etl_user -d zomato_food_db -c \
+		"SELECT pg_drop_replication_slot(slot_name) \
+		 FROM pg_replication_slots WHERE slot_name = 'zomato_food_slot';" 2>/dev/null || true
+	@docker exec -e PGPASSWORD=etl_pass blinkit_db \
+		psql -U etl_user -d blinkit_db -c \
+		"SELECT pg_drop_replication_slot(slot_name) \
+		 FROM pg_replication_slots WHERE slot_name = 'blinkit_slot';" 2>/dev/null || true
+	@docker exec -e PGPASSWORD=etl_pass hyperpure_db \
+		psql -U etl_user -d hyperpure_db -c \
+		"SELECT pg_drop_replication_slot(slot_name) \
+		 FROM pg_replication_slots WHERE slot_name = 'hyperpure_slot';" 2>/dev/null || true
+	@docker exec -e PGPASSWORD=etl_pass district_db \
+		psql -U etl_user -d district_db -c \
+		"SELECT pg_drop_replication_slot(slot_name) \
+		 FROM pg_replication_slots WHERE slot_name = 'district_slot';" 2>/dev/null || true
+	@echo ">>> Recreating replication slots + publications (wal-enable)..."
+	$(MAKE) wal-enable
+	@echo ">>> WAL slots reset — new slots are positioned at current LSN"
+
+## hot-restart — full clean replay from a fresh data dump.
+## Sequence: flush Redis + AuxDB hot state → reset WAL slots → re-seed source
+## data (so the new slots capture every insert) → start hot pipeline.
+hot-restart: hot-clean wal-reset seed
+	@echo ""
+	@echo "============================================"
+	@echo "  Hot pipeline reset complete — starting CDC consumer"
+	@echo "============================================"
+	$(MAKE) hot
