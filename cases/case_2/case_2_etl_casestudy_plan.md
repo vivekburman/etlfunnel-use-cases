@@ -7,10 +7,13 @@
 
 This case study models a real-world order intelligence platform for a large food-tech and quick-commerce conglomerate — modelled after **Zomato** and its sub-brands. Four independent product lines — **Zomato Food, Blinkit, Hyperpure, and District** — each maintain their own PostgreSQL databases with divergent order schemas, status state machines, and fulfilment models.
 
-The pipeline is built on the Streamcraft Execution framework and covers two distinct ingestion paths:
+The pipeline is built on the Streamcraft Execution framework and covers **three distinct pipeline collections**:
 
 - **Cold Flow** — Direct paginated SELECT from each source Postgres DB → Elasticsearch. Covers one year of historical order data that predates WAL enablement.
-- **Hot Flow** — Postgres logical replication (WAL) → Redis Streams → Elasticsearch. Covers all new order events from the moment WAL is enabled forward.
+- **Hot Flow Stage 1 (WAL Ingestion)** — Postgres logical replication (WAL) → Redis Streams. One pipeline per brand reads the WAL slot, decodes change events, and publishes raw JSON messages to the brand's Redis stream. This stage is deliberately isolated: it has no knowledge of Elasticsearch and is the sole writer to Redis. It runs independently so that if Elasticsearch is unavailable or the indexing layer slows down, WAL consumption continues uninterrupted and events buffer in Redis.
+- **Hot Flow Stage 2 (Stream Indexing)** — Redis Streams → Elasticsearch. Separate pipelines consume from the Redis streams via consumer groups, apply the full transformer chain, and bulk-index into Elasticsearch. This stage can be restarted, scaled, or debugged without touching the WAL reader or risking event loss.
+
+Separating Stage 1 and Stage 2 is a deliberate architectural decision. Coupling them in a single pipeline creates a race condition (the consumer tries to create a consumer group on a stream key that does not yet exist) and makes it impossible to independently checkpoint, terminate, or replay either half. Industry-standard tools (Debezium + Kafka Connect, Flink + Kafka) always deploy the CDC producer and the sink consumer as independent units for exactly this reason.
 
 The destination is a single Elasticsearch index (`platform_orders`) that powers cross-brand analytics, ops dashboards, and business intelligence — with records bucketed by sub-brand, city zone, SLA status, time-of-day, order value band, and fulfilment type.
 
@@ -249,26 +252,44 @@ Dynamically adjusts Elasticsearch bulk-index batch size based on pipeline health
 
 For the **hot flow**, slowify also throttles the Redis `XREADGROUP` COUNT parameter — fewer messages fetched per poll — to reduce downstream Elastic pressure while maintaining stream consumption continuity.
 
-### 2.6 Redis Stream Architecture (Hot Flow)
+### 2.6 Redis Stream Architecture
 
-One Redis Stream per sub-brand, fed by a WAL consumer process per brand:
+One Redis Stream per sub-brand acts as the durable buffer between WAL ingestion and Elasticsearch indexing.
 
-| Stream | Producer | Consumer Group |
+| Stream | Stage 1 Producer | Stage 2 Consumer Group |
 |---|---|---|
 | `zomato:orders:stream` | `wal_consumer_zomato_food` | `elastic_writer_group` |
 | `blinkit:orders:stream` | `wal_consumer_blinkit` | `elastic_writer_group` |
 | `hyperpure:orders:stream` | `wal_consumer_hyperpure` | `elastic_writer_group` |
 | `district:orders:stream` | `wal_consumer_district` | `elastic_writer_group` |
 
-Each WAL consumer:
-1. Reads from the brand's logical replication slot via `pgoutput` protocol
-2. Decodes INSERT / UPDATE / DELETE change events
-3. Publishes to the brand's Redis stream as a JSON-encoded message
-4. Acknowledges WAL consumption only after successful Redis publish
+#### Hot Flow Stage 1 — WAL → Redis (WAL Ingestion Pipelines)
 
-The consumer group `elastic_writer_group` has multiple consumers that can be scaled horizontally. Each consumer uses `XREADGROUP` with `XACK` after successful Elasticsearch upsert. Pending entries (unacknowledged) are recovered via `XAUTOCLAIM` on consumer restart.
+Stage 1 is a separate pipeline collection containing one pipeline per brand. Its sole responsibility is reading Postgres WAL and writing raw change events to Redis. It performs no transformation and has no dependency on Elasticsearch.
 
-**Stream message format:**
+**Pipeline behaviour per brand:**
+
+1. Connects to the brand's Postgres logical replication slot (`zomato_food_slot`, `blinkit_slot`, etc.) via the `pgoutput` protocol.
+2. Decodes the raw WAL binary stream into structured change events (INSERT / UPDATE / DELETE), identifying which table and city partition each event belongs to.
+3. Constructs a JSON message per change event and publishes it to the brand's Redis stream via `XADD` with `MAXLEN ~` trim to bound stream memory usage.
+4. Advances the WAL replication slot acknowledgement (`pg_replication_slot_advance`) **only after** the Redis `XADD` succeeds — guaranteeing at-least-once delivery to Redis with no WAL loss.
+5. Writes the last confirmed WAL LSN and Redis stream entry ID to AuxDB `wal_positions` as a dual checkpoint. On restart, the pipeline resumes from this LSN rather than replaying from the slot origin.
+
+**Terminate rules specific to Stage 1:**
+
+| Rule | Condition |
+|---|---|
+| `WAL_SLOT_INACTIVE` | Replication slot reports `active = false` in `pg_replication_slots` |
+| `SOURCE_UNREACHABLE` | Postgres connection failure after N retries |
+| `IDLE_TIMEOUT` | No WAL events received for > N seconds (source has gone quiet) |
+
+**What Stage 1 does NOT do:**
+
+- Does not filter by entity type (orders vs order_items etc.) — all four tables' events go into one stream per brand, tagged with the `table` field. Filtering is Stage 2's responsibility.
+- Does not transform column values — raw Postgres column names and types are preserved in the `after` payload.
+- Does not interact with Elasticsearch in any way.
+
+**Stream message format (written by Stage 1, consumed by Stage 2):**
 ```json
 {
   "op": "INSERT",
@@ -276,9 +297,24 @@ The consumer group `elastic_writer_group` has multiple consumers that can be sca
   "city": "delhi",
   "lsn": "0/1A2B3C4D",
   "ts": "2026-05-11T10:32:00Z",
-  "after": { ...full order row as JSON... }
+  "after": { ...full order row with raw Postgres column names... }
 }
 ```
+
+#### Hot Flow Stage 2 — Redis → Elasticsearch (Stream Indexing Pipelines)
+
+Stage 2 is a separate pipeline collection containing four pipelines per brand (one per entity), consuming from the brand's Redis stream via `XREADGROUP`. Each pipeline filters stream messages by the `table` field to isolate its entity, applies the full transformer chain (including `WALEventUnwrapper`), and bulk-indexes into Elasticsearch.
+
+The consumer group `elastic_writer_group` is shared across all Stage 2 consumers for a given brand. Each consumer uses `XREADGROUP` with `XACK` after a successful Elasticsearch upsert. Pending (unacknowledged) entries are recovered via `XAUTOCLAIM` on consumer restart.
+
+**Terminate rules specific to Stage 2:**
+
+| Rule | Condition |
+|---|---|
+| `REDIS_STREAM_LAG` | Consumer group pending count > N entries for > M seconds |
+| `DESTINATION_SATURATION` | Elasticsearch bulk-index latency > threshold |
+
+Stage 2 can be restarted independently of Stage 1. If Stage 2 is down, Stage 1 continues writing to Redis and events accumulate safely in the stream buffer. When Stage 2 restarts it resumes from the last unacknowledged stream entry — no WAL replay required.
 
 ### 2.7 Auxiliary DB
 
@@ -377,41 +413,57 @@ The index is designed for Elasticsearch aggregations across these dimensions:
 
 ### 4.1 Hierarchy
 
+Three independent pipeline collections. Stage 1 and Stage 2 of the hot flow are separate collections so each can be checkpointed, restarted, and debugged independently.
+
 ```
 Collection  = Zomato Platform Order Intelligence Job
   │
-  ├── Cold Flow Group (flows 1–4)
+  ├── Cold Flow Group (flows 1–4)             [Postgres direct SELECT → Elasticsearch]
   │     ├── flow_1  = zomato_food COLD
   │     │     ├── pipeline_orders
   │     │     ├── pipeline_order_items
   │     │     ├── pipeline_order_status_events
   │     │     └── pipeline_delivery_assignments
-  │     ├── flow_2 = blinkit COLD           (same 4 pipelines)
-  │     ├── flow_3 = hyperpure COLD         (same 4 pipelines)
-  │     └── flow_4 = district COLD          (same 4 pipelines)
+  │     ├── flow_2 = blinkit COLD             (same 4 pipelines)
+  │     ├── flow_3 = hyperpure COLD           (same 4 pipelines)
+  │     └── flow_4 = district COLD            (same 4 pipelines)
   │
-  └── Hot Flow Group (flows 5–8)
-        ├── flow_5 = zomato_food HOT
+  ├── Hot Flow Stage 1 — WAL Ingestion (flows 5–8)   [Postgres WAL → Redis Streams]
+  │     ├── flow_5  = zomato_food WAL INGEST
+  │     │     └── pipeline_wal_ingest          (single pipeline — all 4 tables in one WAL slot)
+  │     ├── flow_6  = blinkit WAL INGEST       (same 1 pipeline)
+  │     ├── flow_7  = hyperpure WAL INGEST     (same 1 pipeline)
+  │     └── flow_8  = district WAL INGEST      (same 1 pipeline)
+  │
+  └── Hot Flow Stage 2 — Stream Indexing (flows 9–12)  [Redis Streams → Elasticsearch]
+        ├── flow_9  = zomato_food HOT INDEX
         │     ├── pipeline_orders
         │     ├── pipeline_order_items
         │     ├── pipeline_order_status_events
         │     └── pipeline_delivery_assignments
-        ├── flow_6 = blinkit HOT            (same 4 pipelines)
-        ├── flow_7 = hyperpure HOT          (same 4 pipelines)
-        └── flow_8 = district HOT           (same 4 pipelines)
+        ├── flow_10 = blinkit HOT INDEX        (same 4 pipelines)
+        ├── flow_11 = hyperpure HOT INDEX      (same 4 pipelines)
+        └── flow_12 = district HOT INDEX       (same 4 pipelines)
 ```
 
-Total pipelines: **8 flows × 4 entity pipelines = 32 pipelines**
+| Collection | Flows | Pipelines per flow | Total pipelines |
+|---|---|---|---|
+| Cold Flow | 4 | 4 entity pipelines | 16 |
+| Hot Stage 1 — WAL Ingestion | 4 | 1 (all tables, one WAL slot) | 4 |
+| Hot Stage 2 — Stream Indexing | 4 | 4 entity pipelines | 16 |
+| **Total** | **12** | | **36** |
 
 ### 4.2 Connectors
 
-| Connector ID | System | Type | Interface |
-|---|---|---|---|
-| connector_1 | `zomato_food_db` | Postgres source | `IClientDBPostgresSource` |
-| connector_2 | `blinkit_db` | Postgres source | `IClientDBPostgresSource` |
-| connector_3 | `hyperpure_db` | Postgres source | `IClientDBPostgresSource` |
-| connector_4 | `district_db` | Postgres source | `IClientDBPostgresSource` |
-| connector_5 | Elasticsearch | Destination | `IClientElasticsearchDestination` |
+| Connector ID | System | Type | Used by | Interface |
+|---|---|---|---|---|
+| connector_1 | `zomato_food_db` | Postgres source | Cold flow + Stage 1 WAL | `IClientDBPostgresSource` |
+| connector_2 | `blinkit_db` | Postgres source | Cold flow + Stage 1 WAL | `IClientDBPostgresSource` |
+| connector_3 | `hyperpure_db` | Postgres source | Cold flow + Stage 1 WAL | `IClientDBPostgresSource` |
+| connector_4 | `district_db` | Postgres source | Cold flow + Stage 1 WAL | `IClientDBPostgresSource` |
+| connector_5 | Elasticsearch | Destination | Cold flow + Stage 2 | `IClientElasticsearchDestination` |
+| connector_6 | Redis | Destination | Stage 1 WAL Ingestion | `IClientRedisStreamDestination` |
+| connector_7 | Redis | Source | Stage 2 Stream Indexing | `IClientRedisStreamSource` |
 
 **Cold flow iso-entities (connector_1 example — zomato_food):**
 
@@ -424,23 +476,32 @@ Total pipelines: **8 flows × 4 entity pipelines = 32 pipelines**
 
 Connectors 2, 3, 4 follow the same pattern with iso_entity IDs 5–16.
 
-**Hot flow iso-entities (connector_1 hot — zomato_food):**
+**Hot Stage 1 iso-entities — WAL → Redis (one per brand, all tables share one WAL slot):**
 
-| iso_entity ID | Entity | Redis stream |
-|---|---|---|
-| iso_entity_17 | orders (hot) | `zomato:orders:stream` |
-| iso_entity_18 | order_items (hot) | `zomato:orders:stream` (filtered by table field) |
-| iso_entity_19 | order_status_events (hot) | `zomato:orders:stream` |
-| iso_entity_20 | delivery_assignments (hot) | `zomato:orders:stream` |
+| iso_entity ID | Brand | WAL slot | Redis stream destination |
+|---|---|---|---|
+| iso_entity_17 | zomato_food | `zomato_food_slot` | `zomato:orders:stream` |
+| iso_entity_18 | blinkit | `blinkit_slot` | `blinkit:orders:stream` |
+| iso_entity_19 | hyperpure | `hyperpure_slot` | `hyperpure:orders:stream` |
+| iso_entity_20 | district | `district_slot` | `district:orders:stream` |
 
-Hot iso-entities 21–32 cover blinkit, hyperpure, district hot flows.
+**Hot Stage 2 iso-entities — Redis → Elasticsearch (connector_7 source, connector_5 destination):**
+
+| iso_entity ID | Entity | Redis stream | Filter |
+|---|---|---|---|
+| iso_entity_21 | orders (zomato_food) | `zomato:orders:stream` | `table = orders` |
+| iso_entity_22 | order_items (zomato_food) | `zomato:orders:stream` | `table = order_items` |
+| iso_entity_23 | order_status_events (zomato_food) | `zomato:orders:stream` | `table = order_status_events` |
+| iso_entity_24 | delivery_assignments (zomato_food) | `zomato:orders:stream` | `table = delivery_assignments` |
+
+iso_entities 25–36 cover blinkit, hyperpure, district Stage 2 flows.
 
 **Destination iso-entities (connector_5 — Elasticsearch):**
 
 | iso_entity ID | Target |
 |---|---|
-| iso_entity_33 | `platform_orders` index (cold write) |
-| iso_entity_34 | `platform_orders` index (hot write) |
+| iso_entity_37 | `platform_orders` index (cold write) |
+| iso_entity_38 | `platform_orders` index (Stage 2 hot write) |
 
 ### 4.3 Orchestrators
 
@@ -452,14 +513,15 @@ Hot iso-entities 21–32 cover blinkit, hyperpure, district hot flows.
 ### 4.4 Peak Parallelism Model
 
 ```
-Cold: 4 brands × 4 entities × up to 3 city splits in-flight = up to 48 concurrent cold workers
-Hot:  4 brands × 4 streams × 1 consumer each               = 16 concurrent hot consumers
-Aux:  1 checkpoint lane + 1 backlog lane                   = 2 auxiliary lanes
-──────────────────────────────────────────────────────────────────────────────────
-Peak: ~66 concurrent goroutine lanes
+Cold:         4 brands × 4 entities × up to 3 city splits in-flight = up to 48 concurrent workers
+Hot Stage 1:  4 brands × 1 WAL reader each                          =  4 concurrent WAL ingesters
+Hot Stage 2:  4 brands × 4 entity consumers × 1 consumer each       = 16 concurrent stream indexers
+Aux:          1 checkpoint lane + 1 backlog lane                    =  2 auxiliary lanes
+──────────────────────────────────────────────────────────────────────────────────────────────────
+Peak: ~70 concurrent goroutine lanes
 ```
 
-In practice, `DestinationWriteTune` slowify caps concurrency during peak hours to protect Elasticsearch.
+Stage 1 and Stage 2 run in separate processes. If Elasticsearch slows and `DestinationWriteTune` fires slowify on Stage 2, Stage 1 is completely unaffected — it continues draining the WAL slot into Redis at full speed.
 
 ---
 
@@ -673,17 +735,18 @@ This section documents what Case 2 introduces that Case 1 did not have — the a
 | Dimension | Detail |
 |---|---|
 | Source DBs | 4 PostgreSQL instances (Zomato Food, Blinkit, Hyperpure, District) |
-| Source read method | Cold: direct SELECT paginated by order_id. Hot: WAL logical replication → Redis Streams |
+| Source read method | Cold: direct SELECT paginated by order_id. Hot Stage 1: WAL logical replication → Redis. Hot Stage 2: Redis → Elasticsearch |
 | City partitioning | 10 cities across 4 zones. Splits at 1M rows cap (same convention as Case 1) |
-| Total Flows | 8 (4 brands × cold + 4 brands × hot) |
-| Total Pipelines | 32 (8 flows × 4 entity pipelines each) |
-| Peak Concurrency | Up to 48 cold workers + 16 hot consumers = 64 concurrent lanes |
-| Transformers | 14 transformers — 13 shared cold/hot + 1 hot-only WAL unwrapper |
-| Control Plane | TerminateRule (9 rules) + DestinationWriteTune (speedify/slowify with ES refresh control) |
-| Checkpoints | Per brand/entity/city/split — cold tracks last PK; hot tracks Redis stream ID + WAL LSN |
+| Pipeline Collections | 3 (Cold Flow, Hot Stage 1 WAL Ingestion, Hot Stage 2 Stream Indexing) |
+| Total Flows | 12 (4 cold + 4 hot Stage 1 + 4 hot Stage 2) |
+| Total Pipelines | 36 (16 cold entity pipelines + 4 WAL ingest pipelines + 16 stream index pipelines) |
+| Peak Concurrency | Up to 48 cold workers + 4 WAL ingesters + 16 stream indexers = ~70 concurrent lanes |
+| Transformers | 14 transformers — 13 shared cold/Stage 2 + 1 Stage-2-only WAL unwrapper. Stage 1 has no transformers. |
+| Control Plane | TerminateRule (9 rules, split across collections) + DestinationWriteTune (speedify/slowify with ES refresh control on Stage 2 only) |
+| Checkpoints | Cold tracks last PK. Stage 1 tracks WAL LSN + Redis stream entry ID. Stage 2 tracks Redis stream entry ID (XACK cursor). |
 | Backlog | AuxDB-backed, includes flow_type and redis_stream_id for hot-flow replay |
-| Redis | 4 streams (one per brand) + 1 consumer group (`elastic_writer_group`) |
+| Redis | 4 streams (one per brand) + 1 consumer group (`elastic_writer_group`). Stage 1 writes, Stage 2 reads. |
 | Destination | Elasticsearch `platform_orders` index — bulk upsert, `_id = {sub_brand}_{order_id}` |
 | AuxDB Tables | 10 operational tables (adds wal_positions, backfill_progress, city_mapping, brand_sla_rules, es_write_log, backfill_completion_log over Case 1's set) |
 | Implementation Steps | 47 steps across 9 phases |
-| New patterns vs Case 1 | WAL CDC, Redis Streams, Elasticsearch destination, dual-flow overlap resolution, District rideless model |
+| New patterns vs Case 1 | WAL CDC, Redis Streams as durable buffer, Elasticsearch destination, three-collection architecture, dual-flow overlap resolution, District rideless model |

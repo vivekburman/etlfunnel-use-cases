@@ -37,6 +37,11 @@ var redisStreams = []string{
 	"district:orders:stream",
 }
 
+// streamLabel trims the common suffix for compact display.
+func streamLabel(s string) string {
+	return strings.TrimSuffix(s, ":orders:stream")
+}
+
 func main() {
 	flag.Parse()
 
@@ -67,6 +72,7 @@ func main() {
 	fmt.Fprintf(out, "Polling every %s\n\n", *flagInterval)
 
 	prevRecords := make(map[string]int64)
+	prevStreamLens := make(map[string]int64)
 	tick := 0
 
 	ticker := time.NewTicker(*flagInterval)
@@ -79,12 +85,12 @@ func main() {
 			return
 		case <-ticker.C:
 			tick++
-			printDashboard(ctx, auxConn, rdb, tick, prevRecords)
+			printDashboard(ctx, auxConn, rdb, tick, prevRecords, prevStreamLens)
 		}
 	}
 }
 
-func printDashboard(ctx context.Context, aux *pgx.Conn, rdb *redis.Client, tick int, prevRecords map[string]int64) {
+func printDashboard(ctx context.Context, aux *pgx.Conn, rdb *redis.Client, tick int, prevRecords map[string]int64, prevStreamLens map[string]int64) {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	fmt.Fprintf(out, "\n%s\n", strings.Repeat("═", 100))
 	fmt.Fprintf(out, "  ZOMATO ORDER INTELLIGENCE METRICS  —  %s  (tick #%d)\n", now, tick)
@@ -92,7 +98,8 @@ func printDashboard(ctx context.Context, aux *pgx.Conn, rdb *redis.Client, tick 
 
 	printColdCheckpoints(ctx, aux, tick, prevRecords)
 	printBackfillCompletion(ctx, aux)
-	printHotStreamLag(ctx, rdb)
+	printHotStage1(ctx, rdb, tick, prevStreamLens)
+	printHotStage2(ctx, rdb)
 	printESDocCounts(*flagES, *flagESUser, *flagESPass)
 	printBacklogSummary(ctx, aux)
 	printWriteTuneConfig(ctx, aux)
@@ -149,24 +156,54 @@ func printBackfillCompletion(ctx context.Context, conn *pgx.Conn) {
 		count, total, float64(count)/float64(total)*100.0)
 }
 
-func printHotStreamLag(ctx context.Context, rdb *redis.Client) {
-	fmt.Fprintln(out, "\n  HOT STREAM LAG (Redis XINFO GROUPS)")
-	fmt.Fprintf(out, "  %-40s  %10s  %10s  %10s\n", "Stream", "Pending", "Delivered", "Consumers")
-	fmt.Fprintf(out, "  %s\n", strings.Repeat("─", 76))
+// printHotStage1 shows WAL → Redis ingestion: stream length and writes per tick.
+func printHotStage1(ctx context.Context, rdb *redis.Client, tick int, prev map[string]int64) {
+	fmt.Fprintln(out, "\n  HOT STAGE 1 — WAL → Redis  (messages written into streams)")
+	fmt.Fprintf(out, "  %-14s  %14s  %14s\n", "Brand", "StreamLen", "Delta/tick")
+	fmt.Fprintf(out, "  %s\n", strings.Repeat("─", 48))
+
+	for _, stream := range redisStreams {
+		length, err := rdb.XLen(ctx, stream).Result()
+		if err != nil {
+			fmt.Fprintf(out, "  %-14s  [unavailable: %v]\n", streamLabel(stream), err)
+			continue
+		}
+		delta := length - prev[stream]
+		if tick == 1 {
+			delta = 0
+		}
+		prev[stream] = length
+
+		deltaStr := fmt.Sprintf("+%s", fmtInt(delta))
+		if delta <= 0 {
+			deltaStr = "  idle"
+		}
+		fmt.Fprintf(out, "  %-14s  %14s  %14s\n", streamLabel(stream), fmtInt(length), deltaStr)
+	}
+}
+
+// printHotStage2 shows Redis → Elasticsearch consumer progress per stream.
+func printHotStage2(ctx context.Context, rdb *redis.Client) {
+	fmt.Fprintln(out, "\n  HOT STAGE 2 — Redis → Elasticsearch  (consumer group progress)")
+	fmt.Fprintf(out, "  %-14s  %-16s  %10s  %10s  %8s  %8s\n",
+		"Brand", "Group", "Pending", "Delivered", "Lag", "Workers")
+	fmt.Fprintf(out, "  %s\n", strings.Repeat("─", 74))
 
 	for _, stream := range redisStreams {
 		groups, err := rdb.XInfoGroups(ctx, stream).Result()
 		if err != nil {
-			fmt.Fprintf(out, "  %-40s  [unavailable: %v]\n", stream, err)
+			fmt.Fprintf(out, "  %-14s  [unavailable: %v]\n", streamLabel(stream), err)
 			continue
 		}
 		if len(groups) == 0 {
-			fmt.Fprintf(out, "  %-40s  no consumer groups\n", stream)
+			fmt.Fprintf(out, "  %-14s  no consumer groups\n", streamLabel(stream))
 			continue
 		}
 		for _, g := range groups {
-			fmt.Fprintf(out, "  %-40s  %10d  %10d  %10d\n",
-				stream, g.Pending, g.EntriesRead, g.Consumers)
+			fmt.Fprintf(out, "  %-14s  %-16s  %10s  %10s  %8s  %8d\n",
+				streamLabel(stream), g.Name,
+				fmtInt(g.Pending), fmtInt(g.EntriesRead),
+				fmtInt(g.Lag), g.Consumers)
 		}
 	}
 }
