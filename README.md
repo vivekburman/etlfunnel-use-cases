@@ -16,26 +16,23 @@ These use cases show what that looks like in practice.
 
 ## Cases
 
-### Case 1 — Telecom Merger: Multi-Source Database Consolidation
+<details>
+<summary><strong>Case 1 — Telecom Merger: Multi-Source Database Consolidation</strong></summary>
 
-**Scenario:** Four telecom companies (Vodafone, Idea, Tata Docomo, Aircel) are being merged. Each has its own MySQL customer database, its own sharding strategy, and its own schema conventions. The goal is to consolidate all customer, subscription, billing, SIM, and porting data into a single unified PostgreSQL destination — without data loss, with deduplication, and with the ability to resume if the pipeline is interrupted.
+Four MySQL databases (Vodafone, Idea, Tata Docomo, Aircel) consolidated into a single PostgreSQL destination with schema normalisation, deduplication, per-shard checkpointing, and dynamic batch tuning.
 
-**What it covers:**
+**Stack:** Go, MySQL 8.0, PostgreSQL, Docker Compose · [Case study](cases/case_1/)
 
-- Connecting to 4 independent MySQL sources with different zone/state sharding schemes
-- Schema normalization across companies with mismatched column names and types
-- Transformations: type casting, PII masking, plan mapping, geo tagging, null handling, dedup checking
-- A 4-layer destination model: `raw → staging → curated → audit`
-- Idempotent writes with `INSERT ... ON CONFLICT DO UPDATE`
-- Per-shard checkpointing so the pipeline can resume exactly where it left off
-- Backlog routing for records that fail validation or hit conflicts
-- Runtime-tunable termination rules (error rate thresholds, idle timeout, manual kill)
-- Dynamic batch size tuning (bulk mode during off-hours, throttled mode during production)
-- A live metrics watcher to monitor pipeline progress
+</details>
 
-**Stack:** Go, MySQL 8.0, PostgreSQL, Docker Compose
+<details>
+<summary><strong>Case 2 — Zomato Platform Order Intelligence: WAL + Cold Backfill to Elasticsearch</strong></summary>
 
-[Go to Case 1](cases/case_1/)
+Four PostgreSQL databases (Zomato Food, Blinkit, Hyperpure, District) unified into a single Elasticsearch index via three independent pipeline collections: a cold backfill flow (paginated SELECT), a WAL ingestion stage (Postgres logical replication → Redis Streams), and a stream indexing stage (Redis Streams → Elasticsearch). Overlap between flows resolved via upsert on `{sub_brand}_{order_id}`.
+
+**Stack:** Go, PostgreSQL (WAL), Redis Streams, Elasticsearch, Docker Compose · [Case study](cases/case_2/)
+
+</details>
 
 ---
 
