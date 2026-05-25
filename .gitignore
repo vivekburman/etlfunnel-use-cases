@@ -32,4 +32,5 @@ go.work.sum
 # .vscode/
 
 .claude/
-cases/case_1/metrics.log
+**/metrics.log
+core_modules/

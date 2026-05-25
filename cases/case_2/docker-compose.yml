@@ -1,0 +1,186 @@
+version: "3.9"
+
+networks:
+  zomato_net:
+    driver: bridge
+
+volumes:
+  zomato_food_data:
+  blinkit_data:
+  hyperpure_data:
+  district_data:
+  auxdb_data:
+  redis_data:
+  es_data:
+
+services:
+
+  zomato_food_db:
+    image: postgres:15
+    container_name: zomato_food_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: zomato_food_db
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5441:5432"
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=10
+        -c max_wal_senders=10
+    volumes:
+      - zomato_food_data:/var/lib/postgresql/data
+    networks:
+      - zomato_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d zomato_food_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  blinkit_db:
+    image: postgres:15
+    container_name: blinkit_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: blinkit_db
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5442:5432"
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=10
+        -c max_wal_senders=10
+    volumes:
+      - blinkit_data:/var/lib/postgresql/data
+    networks:
+      - zomato_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d blinkit_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  hyperpure_db:
+    image: postgres:15
+    container_name: hyperpure_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hyperpure_db
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5443:5432"
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=10
+        -c max_wal_senders=10
+    volumes:
+      - hyperpure_data:/var/lib/postgresql/data
+    networks:
+      - zomato_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d hyperpure_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  district_db:
+    image: postgres:15
+    container_name: district_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: district_db
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5444:5432"
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=10
+        -c max_wal_senders=10
+    volumes:
+      - district_data:/var/lib/postgresql/data
+    networks:
+      - zomato_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d district_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  auxdb:
+    image: postgres:15
+    container_name: auxdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auxdb
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5445:5432"
+    volumes:
+      - auxdb_data:/var/lib/postgresql/data
+    networks:
+      - zomato_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d auxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --requirepass etl_pass
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - zomato_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "etl_pass", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.1
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=etl_pass
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - zomato_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -u elastic:etl_pass http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
