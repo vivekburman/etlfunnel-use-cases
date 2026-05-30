@@ -26,7 +26,7 @@ func Load() *Config {
 		MSSQLUser: getEnv("MSSQL_USER", "etl_writer"),
 		MSSQLPass: getEnv("MSSQL_PASS", "Etl_Pass_456!"),
 		AuxDBDSN:  getEnv("AUXDB_DSN", "host=localhost port=5446 dbname=auxdb user=etl_user password=etl_pass sslmode=disable"),
-		SeedURL:   getEnv("SEEDER_URL", "http://localhost:9090"),
+		SeedURL:   getEnv("SEEDER_URL", "http://localhost:11333"),
 	}
 }
 

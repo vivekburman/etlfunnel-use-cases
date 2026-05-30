@@ -36,7 +36,7 @@ var surfaceMap = map[string]string{
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	port := getEnv("SEEDER_PORT", "9090")
+	port := getEnv("SEEDER_PORT", "11333")
 	rowsPerDay := parseInt(getEnv("ROWS_PER_DAY", "15000"), 15000)
 	dateFrom := getEnv("DATE_FROM", "2024-01-01")
 	dateTo := getEnv("DATE_TO", "2025-12-31")

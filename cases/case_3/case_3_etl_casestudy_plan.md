@@ -448,7 +448,7 @@ The seeder is a Go HTTP server that mimics the GA4 Data API (`POST :runReport`) 
 
 ```
 seeder/
-  cmd/seeder/main.go       -- starts HTTP server on :9090
+  cmd/seeder/main.go       -- starts HTTP server on :11333
   handlers/report.go       -- handles /v1beta/{property}:runReport
   handlers/realtime.go     -- handles /v1beta/{property}:runRealtimeReport
   generators/sessions.go   -- generates synthetic session rows
@@ -474,7 +474,7 @@ seeder/
 ```
 1. Reads DATE_FROM / DATE_END from environment.
 2. Generates all session rows in memory (or streams from disk for large runs).
-3. Starts HTTP server on :9090.
+3. Starts HTTP server on :11333.
 4. Listens for POST requests; routes by endpoint.
 5. Returns paginated responses with correct GA4 JSON shape.
 6. Shuts down after SIGTERM (triggered by `make seed-stop`).
@@ -520,14 +520,14 @@ The following are intentional scope boundaries for this case study — deferred 
 
 ### Phase 1 — Infrastructure Setup
 
-- [ ] **STEP-01** — Write `docker-compose.yml` with 2 services: SQL Server (`mcr.microsoft.com/mssql/server:2022-latest`, port `1433`) and the GA4 seeder HTTP server (built from `Dockerfile.seeder`, port `9090`). Pass `SA_PASSWORD`, `ACCEPT_EULA`, and `DATE_FROM`/`DATE_END` env vars. Add a healthcheck on SQL Server (`/opt/mssql-tools18/bin/sqlcmd -Q "SELECT 1"`) so dependent services wait for it to be ready.
+- [ ] **STEP-01** — Write `docker-compose.yml` with 2 services: SQL Server (`mcr.microsoft.com/mssql/server:2022-latest`, port `1433`) and the GA4 seeder HTTP server (built from `Dockerfile.seeder`, port `11333`). Pass `SA_PASSWORD`, `ACCEPT_EULA`, and `DATE_FROM`/`DATE_END` env vars. Add a healthcheck on SQL Server (`/opt/mssql-tools18/bin/sqlcmd -Q "SELECT 1"`) so dependent services wait for it to be ready.
 - [ ] **STEP-02** — Implement `cmd/sql_schema/main.go` — connects to SQL Server using the `etl_writer` service account and creates all schemas and tables defined in §2: `dbo.ga4_sessions` (with clustered index on `(property_id, report_date)`, non-clustered index on `(source, medium, campaign)`, and columnstore index on `(report_date, property_id, conversions, purchase_revenue_inr)`), `stage.ga4_sessions` (HEAP, no indexes), `dbo.realtime_sessions`, `dbo.pipeline_run_log`, and `dbo.pipeline_backlog` (for failed records). Idempotent: uses `IF NOT EXISTS` guards on all `CREATE TABLE` and `CREATE INDEX` statements.
-- [ ] **STEP-03** — Implement `internal/config/config.go` — SQL Server DSN builder (server, port, database, username, password), GA4 seeder base URL (`http://localhost:9090`), and constants for the three property IDs and surface labels (`myntra-web/web`, `myntra-android/android`, `myntra-ios/ios`). Reads values from environment variables with documented fallback defaults for local development.
+- [ ] **STEP-03** — Implement `internal/config/config.go` — SQL Server DSN builder (server, port, database, username, password), GA4 seeder base URL (`http://localhost:11333`), and constants for the three property IDs and surface labels (`myntra-web/web`, `myntra-android/android`, `myntra-ios/ios`). Reads values from environment variables with documented fallback defaults for local development.
 - [ ] **STEP-04** — Implement `internal/properties/properties.go` — defines the three GA4 property structs including property ID, surface label, primary conversion event name, and the per-property custom dimension name map (§1.4). This is the single source of truth referenced by both the connector and the `DimensionNormaliser` transformer.
 
 ### Phase 2 — Data Seeder
 
-- [ ] **STEP-05** — Implement `seeder/cmd/seeder/main.go` — starts an HTTP server on `:9090`. Reads `DATE_FROM` / `DATE_END` from environment, generates all synthetic session data in memory (or streams from disk for runs exceeding 500K rows per property), then begins listening. Handles `SIGTERM` for graceful shutdown.
+- [ ] **STEP-05** — Implement `seeder/cmd/seeder/main.go` — starts an HTTP server on `:11333`. Reads `DATE_FROM` / `DATE_END` from environment, generates all synthetic session data in memory (or streams from disk for runs exceeding 500K rows per property), then begins listening. Handles `SIGTERM` for graceful shutdown.
 - [ ] **STEP-06** — Implement `seeder/generators/sessions.go` — generates synthetic session rows for all three properties and all requested dates. Volume: 10,000–250,000 rows/day/property drawn from a log-normal distribution. Each row includes all core dimensions (§1.2), property-specific custom dimensions using the correct per-property names (e.g., `customEvent:product_category` for web, `customEvent:category_slug` for android, `customEvent:item_category` for iOS), and all 10 core metrics (§1.5). Conversion rate: 2.5% ± 0.5%. Revenue per conversion: ₹800–₹12,000 uniform.
 - [ ] **STEP-07** — Implement `seeder/handlers/report.go` — handles `POST /v1beta/{property}:runReport`. Parses `offset` and `limit` from the request body, returns a correctly shaped GA4 JSON response (§4.3) with `dimensionHeaders`, `metricHeaders`, `rows` (positional value arrays), and `rowCount`. Enforces the 100,000-row hard limit per response. Returns HTTP 429 with a `RESOURCE_EXHAUSTED` body after 40,000 simulated tokens/hour per property (enforced via `seeder/state/quota.go`).
 - [ ] **STEP-08** — Implement `seeder/handlers/realtime.go` — handles `POST /v1beta/{property}:runRealtimeReport`. Returns a snapshot of ~300 active-user rows per property, varying slightly on each call to simulate live fluctuation. No pagination. Respects the 10,000 realtime tokens/day/property budget tracked in `seeder/state/quota.go`.

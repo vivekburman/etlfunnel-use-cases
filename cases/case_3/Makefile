@@ -7,27 +7,28 @@
 #   make deps         — download Go module dependencies
 #   make auxdb        — create AuxDB schemas + seed reference data
 #   make migrate      — create SQL Server schemas, tables, indexes
-#   make seed         — start the GA4 mock seeder HTTP server (:9090)
+#   make seed         — start the GA4 mock seeder HTTP server (:11333)
 #   make seed-stop    — stop the seeder process
 #   make setup        — full bootstrap: up → auxdb → migrate
-#   make backfill     — run Historical Backfill Flow (730 days × 3 properties)
-#   make daily        — run Incremental Daily Flow (T-2 + T-1 for all 3 properties)
-#   make realtime     — run a single Realtime Pulse snapshot (test mode)
 #   make verify       — assert row counts and no duplicates in SQL Server
 #   make clean        — truncate stage.* and dbo.ga4_sessions / realtime_sessions
 #   make down         — stop containers (keep volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
 #   make logs         — tail all container logs
 #   make status       — show container health
+#   make watch        — live metrics dashboard (polls until Ctrl+C)
+#                       Override: make watch INTERVAL=10s
 #   make test         — run Go unit tests
 #   make lint         — run golangci-lint
 #
-# BACKFILL OVERRIDES:
-#   make backfill DATE_FROM=2024-06-01 DATE_TO=2024-12-31
-#   make seed ROWS_PER_DAY=5000 SEEDER_PORT=9090
+# SEED OVERRIDES:
+#   make seed ROWS_PER_DAY=5000 SEEDER_PORT=11333
 
 SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -euo pipefail -c
+
+# Redirect Go build cache to a local dir so Windows doesn't block execution from %TEMP%
+export GOTMPDIR := $(CURDIR)/tmp
 
 COMPOSE_FILE   := docker-compose.yml
 
@@ -40,15 +41,14 @@ MSSQL_PASS     ?= Etl_Pass_456!
 
 AUXDB_DSN      ?= host=localhost port=5446 dbname=auxdb user=etl_user password=etl_pass sslmode=disable
 
-SEEDER_PORT    ?= 9090
+SEEDER_PORT    ?= 11333
 SEEDER_URL     ?= http://localhost:$(SEEDER_PORT)
 ROWS_PER_DAY   ?= 15000
 
-DATE_FROM      ?= 2024-01-01
-DATE_TO        ?= 2025-12-31
+INTERVAL       ?= 5s
 
 .PHONY: up down reset wait-healthy deps auxdb migrate seed seed-stop setup \
-        backfill daily realtime verify clean logs status test lint
+        verify clean logs status watch test lint
 
 ## Start SQL Server + AuxDB containers
 up:
@@ -108,10 +108,8 @@ migrate:
 ## Start GA4 mock seeder HTTP server in the background
 seed:
 	@echo ">>> Starting GA4 seeder on :$(SEEDER_PORT)..."
-	DATE_FROM=$(DATE_FROM) DATE_TO=$(DATE_TO) \
 	ROWS_PER_DAY=$(ROWS_PER_DAY) SEEDER_PORT=$(SEEDER_PORT) \
-	go run ./cmd/seeder &
-	echo $$! > .seeder.pid
+	go run ./cmd/seeder & echo $$! > .seeder.pid
 	@echo "  Seeder PID: $$(cat .seeder.pid)"
 	@sleep 2
 	@echo ">>> Seeder listening on :$(SEEDER_PORT)"
@@ -128,34 +126,7 @@ seed-stop:
 
 ## Full bootstrap: start containers → auxdb → migrate
 setup: up auxdb migrate
-	@echo ">>> Setup complete. Run 'make seed' then 'make backfill' to ingest data."
-
-## Run Historical Backfill Flow (all 3 properties, chunked by day)
-backfill:
-	@echo ">>> Starting Historical Backfill: $(DATE_FROM) → $(DATE_TO)"
-	SEEDER_URL=$(SEEDER_URL) \
-	MSSQL_HOST=$(MSSQL_HOST) MSSQL_PORT=$(MSSQL_PORT) MSSQL_DB=$(MSSQL_DB) \
-	MSSQL_USER=$(MSSQL_USER) MSSQL_PASS="$(MSSQL_PASS)" \
-	AUXDB_DSN="$(AUXDB_DSN)" \
-	DATE_FROM=$(DATE_FROM) DATE_TO=$(DATE_TO) \
-	go run ./cmd/backfill
-
-## Run Incremental Daily Flow (T-2 + T-1 for all 3 properties)
-daily:
-	@echo ">>> Starting Incremental Daily Flow..."
-	SEEDER_URL=$(SEEDER_URL) \
-	MSSQL_HOST=$(MSSQL_HOST) MSSQL_PORT=$(MSSQL_PORT) MSSQL_DB=$(MSSQL_DB) \
-	MSSQL_USER=$(MSSQL_USER) MSSQL_PASS="$(MSSQL_PASS)" \
-	AUXDB_DSN="$(AUXDB_DSN)" \
-	go run ./cmd/daily
-
-## Run a single Realtime Pulse snapshot (for testing; exits after one poll)
-realtime:
-	@echo ">>> Starting Realtime Pulse (single snapshot)..."
-	SEEDER_URL=$(SEEDER_URL) \
-	MSSQL_HOST=$(MSSQL_HOST) MSSQL_PORT=$(MSSQL_PORT) MSSQL_DB=$(MSSQL_DB) \
-	MSSQL_USER=$(MSSQL_USER) MSSQL_PASS="$(MSSQL_PASS)" \
-	go run ./cmd/realtime --once
+	@echo ">>> Setup complete. Run 'make seed' to start the GA4 mock server."
 
 ## Assert row counts and no duplicates
 verify:
@@ -195,6 +166,13 @@ status:
 	@docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
 		--filter name=analytics_sqlserver \
 		--filter name=auxdb
+
+## Live metrics dashboard (polls SQL Server + AuxDB until Ctrl+C)
+watch:
+	MSSQL_HOST=$(MSSQL_HOST) MSSQL_PORT=$(MSSQL_PORT) MSSQL_DB=$(MSSQL_DB) \
+	MSSQL_USER=$(MSSQL_USER) MSSQL_PASS="$(MSSQL_PASS)" \
+	AUXDB_DSN="$(AUXDB_DSN)" \
+	go run ./cmd/metrics_watcher --interval $(INTERVAL)
 
 ## Run Go unit tests
 test:
