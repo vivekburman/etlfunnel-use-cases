@@ -1,0 +1,54 @@
+version: "3.9"
+
+networks:
+  myntra_net:
+    driver: bridge
+
+volumes:
+  sqlserver_data:
+  auxdb_data:
+
+services:
+
+  analytics_sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: analytics_sqlserver
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "Etl_Pass_123!"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    networks:
+      - myntra_net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'Etl_Pass_123!' -C -Q 'SELECT 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  auxdb:
+    image: postgres:15
+    container_name: auxdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auxdb
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5446:5432"
+    volumes:
+      - auxdb_data:/var/lib/postgresql/data
+    networks:
+      - myntra_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d auxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s

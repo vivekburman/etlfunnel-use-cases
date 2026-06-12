@@ -1,0 +1,26 @@
+linters-settings:
+  goimports:
+    local-prefixes: github.com/streamcraft/myntra-etl
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - goimports
+    - revive
+  disable:
+    - depguard
+
+run:
+  timeout: 5m
+  tests: true
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
