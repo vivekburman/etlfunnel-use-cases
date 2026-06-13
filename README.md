@@ -34,6 +34,15 @@ Four PostgreSQL databases (Zomato Food, Blinkit, Hyperpure, District) unified in
 
 </details>
 
+<details>
+<summary><strong>Case 3 — Myntra Digital Analytics Intelligence: GA4 Multi-Property → MSSQL</strong></summary>
+
+Three Google Analytics 4 properties (Web, Android, iOS) ingested into a Microsoft SQL Server data warehouse via three pipeline flows: a historical backfill flow (730-day chunked daily pagination with quota throttling), an incremental daily flow (T-2 upsert for settled GA4 data), and a realtime pulse flow (60-second cadence via the GA4 Realtime API). Central challenge is GA4 quota exhaustion — per-property, per-hour token budgets require the pipeline to track spend and back off before limits are hit.
+
+**Stack:** Go, REST API (GA4 Data API), Microsoft SQL Server, Docker Compose · [Case study](cases/case_3/)
+
+</details>
+
 ---
 
 ## How to use this repo
