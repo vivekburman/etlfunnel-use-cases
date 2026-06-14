@@ -30,15 +30,23 @@ func main() {
 
 	port := getEnv("SEEDER_PORT", "11334")
 	totalEvents := parseInt(getEnv("TOTAL_EVENTS", "2000"), 2000)
+	faultRate := parseInt(getEnv("FAULT_RATE", "0"), 0)
 
 	log.Printf("=== Zepto Order Events Mock Seeder ===")
 	log.Printf("  port:         :%s", port)
 	log.Printf("  total events: %d", totalEvents)
+	log.Printf("  fault rate:   %d%% (drop / storage-backlog / ingestion-backlog cycling)", faultRate)
 	log.Printf("  endpoint:     GET /api/v2/order-events?cursor=<seq>&limit=<n>")
 	log.Printf("  auth:         X-Internal-Token header (any non-empty value)")
 
-	pool := generators.Generate(totalEvents)
-	log.Printf("  generated %d events across %d cities", len(pool), 7)
+	pool := generators.GenerateMixed(totalEvents, faultRate)
+	faultCount := 0
+	for _, ev := range pool {
+		if ev.City == "" || ev.CreatedAt == "INVALID_TIMESTAMP" {
+			faultCount++
+		}
+	}
+	log.Printf("  generated %d events (%d fault records) across %d cities", len(pool), faultCount, 7)
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/v2/order-events", handlers.NewOrderEventsHandler(pool))

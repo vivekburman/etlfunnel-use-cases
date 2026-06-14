@@ -72,6 +72,7 @@ services:
       CASSANDRA_CLUSTER_NAME: zepto-cluster
       CASSANDRA_DC: dc1
       CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1
     volumes:
       - cassandra_data:/var/lib/cassandra
     networks:

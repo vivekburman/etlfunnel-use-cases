@@ -11,8 +11,9 @@
 #   make deps         — download Go module dependencies
 #   make auxdb        — create AuxDB tables (run once after 'up')
 #   make cassandra    — create Cassandra keyspace + table (run once after 'up')
-#   make seed         — start Zepto REST API mock server (:11334)
+#   make seed         — start Zepto REST API mock server (:11334) with realistic fault mix
 #   make seed-stop    — stop the mock seeder
+#   make seed-backlog — insert synthetic backlog rows into AuxDB (instant non-zero Loki widgets)
 #   make setup        — full bootstrap: up → auxdb
 #   make watch        — live metrics dashboard (polls AuxDB, Ctrl+C to exit)
 #                       Override: make watch INTERVAL=10s
@@ -44,11 +45,14 @@ AUXDB_DSN   ?= postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disab
 
 SEEDER_PORT  ?= 11334
 TOTAL_EVENTS ?= 2000
+FAULT_RATE   ?= 5
+
+BACKLOG_N    ?= 20
 
 INTERVAL     ?= 5s
 
-.PHONY: up down reset wait-healthy deps auxdb cassandra seed seed-stop setup \
-        watch logs status lint
+.PHONY: up down reset wait-healthy deps auxdb cassandra seed seed-stop \
+        seed-backlog setup watch logs status lint
 
 ## Start AuxDB + Kafka + Cassandra containers
 up:
@@ -120,15 +124,21 @@ cassandra:
 		  AND comment = 'Order lifecycle events. TTL=90d set per-row by pipeline.';"
 	@echo ">>> Cassandra ready"
 
-## Start Zepto REST API mock server in the background
-seed:
-	@echo ">>> Starting Zepto mock seeder on :$(SEEDER_PORT) with $(TOTAL_EVENTS) events..."
-	SEEDER_PORT=$(SEEDER_PORT) TOTAL_EVENTS=$(TOTAL_EVENTS) \
+## Start Zepto REST API mock server in the background (stops any existing instance first)
+seed: seed-stop
+	@echo ">>> Starting Zepto mock seeder on :$(SEEDER_PORT) with $(TOTAL_EVENTS) events (fault_rate=$(FAULT_RATE)%)..."
+	SEEDER_PORT=$(SEEDER_PORT) TOTAL_EVENTS=$(TOTAL_EVENTS) FAULT_RATE=$(FAULT_RATE) \
 	go run ./cmd/seeder & echo $$! > .seeder.pid
 	@echo "  Seeder PID: $$(cat .seeder.pid)"
 	@sleep 2
 	@echo ">>> Seeder listening on :$(SEEDER_PORT)"
 	@echo ">>> API: GET http://localhost:$(SEEDER_PORT)/api/v2/order-events?limit=500"
+
+## Seed both AuxDB backlog tables with synthetic failed records (instant non-zero Loki widgets)
+seed-backlog:
+	@echo ">>> Seeding backlog tables with $(BACKLOG_N) synthetic failures each..."
+	go run ./cmd/backlog_seeder -n $(BACKLOG_N)
+	@echo ">>> Done. Run 'make watch' to verify."
 
 ## Stop the mock seeder
 seed-stop:
@@ -143,7 +153,8 @@ seed-stop:
 ## Full bootstrap: start containers → auxdb → cassandra
 setup: up auxdb cassandra
 	@echo ">>> Setup complete."
-	@echo ">>> Run 'make seed' to start the Zepto mock API server."
+	@echo ">>> Tip: run 'make seed-backlog' to pre-populate backlog tables for Loki widget coverage."
+	@echo ">>> Run 'make seed' to start the Zepto mock API (includes 5% fault records by default)."
 	@echo ">>> Then start Flow 2 (pid=29) followed by Flow 1 (pid=28) in streamcraftexecution."
 
 ## Live metrics dashboard

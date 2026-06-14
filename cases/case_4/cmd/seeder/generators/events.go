@@ -57,9 +57,28 @@ type OrderEvent struct {
 // Using modular arithmetic instead of math/rand to keep it deterministic
 // without relying on a seed.
 func Generate(n int) []OrderEvent {
+	return GenerateMixed(n, 0)
+}
+
+// GenerateMixed produces n events with faultPercent% replaced by fault records.
+//
+// Three fault types cycle in round-robin so all failure paths fire:
+//   A (city="")              → transformer_81 drops the record (records-dropped metric)
+//   B (created_at="INVALID") → transformer_84 parse error → zepto_storage_backlog (Flow 2)
+//   C (payload._fault_inject) → transformer_81 returns error → zepto_ingestion_backlog (Flow 1)
+//
+// faultPercent=0 returns a clean pool identical to Generate(n).
+func GenerateMixed(n int, faultPercent int) []OrderEvent {
 	events := make([]OrderEvent, n)
 	// Base time: 25 days ago, advancing 1 minute per event so none are older than 90 days.
 	base := time.Now().UTC().Add(-25 * 24 * time.Hour)
+
+	// Compute fault injection interval: inject a fault every `interval` records.
+	interval := 0
+	if faultPercent > 0 && faultPercent <= 100 {
+		interval = 100 / faultPercent
+	}
+	faultSeq := 0
 
 	for i := 0; i < n; i++ {
 		cityIdx := i % len(cities)
@@ -89,7 +108,7 @@ func Generate(n int) []OrderEvent {
 
 		payload := buildPayload(eventType, i)
 
-		events[i] = OrderEvent{
+		ev := OrderEvent{
 			EventID:    eventID,
 			OrderID:    orderID,
 			CustomerID: customerID,
@@ -101,8 +120,37 @@ func Generate(n int) []OrderEvent {
 			CreatedAt:  createdAt.Format(time.RFC3339),
 			Payload:    payload,
 		}
+
+		if interval > 0 && (i+1)%interval == 0 {
+			ev = applyFault(ev, faultSeq)
+			faultSeq++
+		}
+
+		events[i] = ev
 	}
 	return events
+}
+
+// applyFault mutates an event to exercise a specific failure path in the pipeline.
+func applyFault(ev OrderEvent, seq int) OrderEvent {
+	switch seq % 3 {
+	case 0:
+		// Type A: empty city → transformer_81 returns nil (silent drop) → records-dropped metric.
+		ev.City = ""
+	case 1:
+		// Type B: unparseable created_at → transformer_84 returns error → zepto_storage_backlog.
+		ev.CreatedAt = "INVALID_TIMESTAMP"
+	case 2:
+		// Type C: fault-inject marker in payload → transformer_81 returns error → zepto_ingestion_backlog.
+		// Copy the map to avoid mutating the shared buildPayload result.
+		p := make(map[string]any, len(ev.Payload)+1)
+		for k, v := range ev.Payload {
+			p[k] = v
+		}
+		p["_fault_inject"] = "error"
+		ev.Payload = p
+	}
+	return ev
 }
 
 func buildPayload(eventType string, seed int) map[string]any {
