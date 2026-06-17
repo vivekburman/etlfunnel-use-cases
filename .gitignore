@@ -32,5 +32,7 @@ go.work.sum
 # .vscode/
 
 .claude/
-**/metrics.log
 core_modules/
+metrics.log
+.seeder.pid
+**/tmp/
