@@ -43,6 +43,15 @@ Three Google Analytics 4 properties (Web, Android, iOS) ingested into a Microsof
 
 </details>
 
+<details>
+<summary><strong>Case 4 — Zepto Order Events: REST API (cursor) → Kafka → Cassandra</strong></summary>
+
+Zepto order lifecycle events (ORDER_CREATED → ORDER_DELIVERED) ingested from an internal REST API across 7 cities and written into Cassandra for analytics and auditing, via two decoupled pipeline flows: a cursor ingestion flow (paginated GET with cursor checkpointing → Kafka topic `zepto.order.events`) and a stream storage flow (Kafka → Cassandra `zepto_events.order_events`). Each flow maintains its own AuxDB checkpoint table — cursor positions for Flow 1, per-partition Kafka offsets for Flow 2 — so either can resume independently after a crash. Three distinct fault paths are exercised: silent record drops (missing city), parse errors routed to `zepto_storage_backlog` (Flow 2), and publish errors routed to `zepto_ingestion_backlog` (Flow 1). Cassandra table is partitioned by `(city, store_id)` with a 90-day TTL and TimeWindowCompactionStrategy for time-series workloads.
+
+**Stack:** Go, REST API (cursor pagination), Kafka (KRaft), Cassandra 4.1, PostgreSQL (AuxDB), Docker Compose · [Case study](cases/case_4/)
+
+</details>
+
 ---
 
 ## How to use this repo
