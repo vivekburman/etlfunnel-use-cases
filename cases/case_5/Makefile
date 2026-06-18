@@ -54,7 +54,7 @@ ENRICH_URL      ?= http://$(MAC_IP):8765
 SEED_N          ?= 200
 COLLECTION_JSON ?= C:/Users/vivek/streamcraftexecution/collection.json
 
-.PHONY: up down reset wait-healthy deps auxdb es-index seed setup logs status ping-mac patch-collection
+.PHONY: up down reset wait-healthy deps auxdb es-index seed setup oracle-pull oracle-run oracle-schema oracle-seed oracle-setup logs status ping-mac patch-collection
 
 ## Start all containers
 up:
@@ -120,6 +120,85 @@ setup: up auxdb es-index seed
 	@echo "   3. export PF_POSTGRES_PASSWORD=etl_pass ENRICH_SERVICE_URL=http://localhost:8765"
 	@echo "   4. Start flows: pid=34 → pid=35 → pid=32"
 	@echo "   5. Verify ES:   curl http://$(ES_URL)/pf_products/_count"
+
+## ── Oracle (Flow 33 source — manual license required) ──────────────────────
+##
+## Oracle XE is excluded from docker-compose.yml because the image requires
+## accepting Oracle's license at container-registry.oracle.com before pulling.
+##
+## Run these targets in order (once only):
+##   make oracle-pull    — authenticate and pull the Oracle XE image
+##   make oracle-run     — start the Oracle XE container on port 1521
+##   make oracle-schema  — create etl_user and PRODUCT_ATTRS table
+##   make oracle-seed    — insert 50 synthetic ERP product rows
+##   make oracle-setup   — runs oracle-run → oracle-schema → oracle-seed
+##
+## Prerequisites:
+##   docker login container-registry.oracle.com
+##   (accept the Oracle Database license at https://container-registry.oracle.com)
+
+ORACLE_PWD      ?= etl_pass
+ORACLE_IMG      ?= container-registry.oracle.com/database/express:21.3.0-xe
+
+## Pull Oracle XE image (requires docker login to container-registry.oracle.com first)
+oracle-pull:
+	@echo ">>> Pulling Oracle XE image (requires prior docker login)..."
+	docker pull $(ORACLE_IMG)
+	@echo "  ✓ Oracle XE image ready"
+
+## Start Oracle XE container on port 1521
+oracle-run:
+	@echo ">>> Starting Oracle XE container..."
+	docker run -d --name pf_oracle \
+		-p 1521:1521 \
+		-e ORACLE_PWD=$(ORACLE_PWD) \
+		$(ORACLE_IMG)
+	@echo "  Waiting for Oracle listener (up to 3 min)..."
+	@for i in $$(seq 1 36); do \
+		STATUS=$$(docker inspect --format='{{.State.Health.Status}}' pf_oracle 2>/dev/null || echo "missing"); \
+		if [ "$$STATUS" = "healthy" ]; then echo "  ✓ Oracle ready"; break; fi; \
+		printf "."; sleep 5; \
+	done
+	@echo ""
+
+## Create etl_user and PRODUCT_ATTRS table in Oracle XE
+oracle-schema:
+	@echo ">>> Creating Oracle schema and PRODUCT_ATTRS table..."
+	@printf '%s\n' \
+		'ALTER SESSION SET "_ORACLE_SCRIPT"=TRUE;' \
+		'CREATE USER etl_user IDENTIFIED BY $(ORACLE_PWD);' \
+		'GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE TO etl_user;' \
+		'EXIT;' \
+		| docker exec -i pf_oracle sqlplus -S SYSTEM/$(ORACLE_PWD)@//localhost:1521/XEPDB1
+	@printf '%s\n' \
+		'CREATE TABLE PRODUCT_ATTRS (' \
+		'  PRODUCT_ID  VARCHAR2(50)  NOT NULL PRIMARY KEY,' \
+		'  SKU_CODE    VARCHAR2(100),' \
+		'  SUPPLIER_ID VARCHAR2(50),' \
+		'  WEIGHT_KG   NUMBER(8,3),' \
+		'  CATEGORY    VARCHAR2(100),' \
+		'  COMPLIANCE  VARCHAR2(500),' \
+		'  UPDATED_AT  TIMESTAMP DEFAULT SYSTIMESTAMP' \
+		');' \
+		'EXIT;' \
+		| docker exec -i pf_oracle sqlplus -S etl_user/$(ORACLE_PWD)@//localhost:1521/XEPDB1
+	@echo "  ✓ Oracle schema ready"
+
+## Seed Oracle PRODUCT_ATTRS with synthetic ERP rows
+oracle-seed:
+	@echo ">>> Seeding Oracle PRODUCT_ATTRS..."
+	go run ./cmd/oracle_seeder -host localhost -port 1521 -service XEPDB1 \
+		-user etl_user -password $(ORACLE_PWD) -n 50
+	@echo "  ✓ Oracle seed complete"
+
+## Full Oracle bootstrap: run container → create schema → seed data
+oracle-setup: oracle-run oracle-schema oracle-seed
+	@echo ""
+	@echo ">>> Oracle setup complete."
+	@echo "   Set env var before running flows: $$env:PF_ORACLE_PASSWORD=$(ORACLE_PWD)"
+	@echo "   Flow 33 (pid=33) reads from etl_user.PRODUCT_ATTRS on localhost:1521/XEPDB1"
+
+## ────────────────────────────────────────────────────────────────────────────
 
 ## Patch collection.json with current MAC_IP and correct Postgres settings (re-run if Mac IP changes)
 patch-collection:

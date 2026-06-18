@@ -69,8 +69,11 @@ func main() {
 }
 
 func ensureTable(ctx context.Context, conn *pgx.Conn) error {
+	if _, err := conn.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS pf_catalog`); err != nil {
+		return fmt.Errorf("create schema pf_catalog: %w", err)
+	}
 	_, err := conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS products (
+		CREATE TABLE IF NOT EXISTS pf_catalog.products (
 			product_id   VARCHAR(50) PRIMARY KEY,
 			title        TEXT        NOT NULL,
 			description  TEXT,
@@ -83,7 +86,7 @@ func ensureTable(ctx context.Context, conn *pgx.Conn) error {
 	if err != nil {
 		return fmt.Errorf("create products table: %w", err)
 	}
-	log.Println("  ✓ products table ready")
+	log.Println("  ✓ pf_catalog.products table ready")
 	return nil
 }
 
@@ -115,7 +118,7 @@ func insertProducts(ctx context.Context, conn *pgx.Conn, n int) (int, error) {
 		updatedAt := now.Add(-time.Duration(rng.Intn(30*24)) * time.Hour)
 
 		batch.Queue(`
-			INSERT INTO products (product_id, title, description, category, price, material, dimensions, updated_at)
+			INSERT INTO pf_catalog.products (product_id, title, description, category, price, material, dimensions, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
 			ON CONFLICT (product_id) DO UPDATE SET
 				title       = EXCLUDED.title,
