@@ -4,75 +4,80 @@
 # ============================================================
 #
 # PREREQUISITES:
-#   - Ollama installed: brew install ollama
-#   - Model pulled:    ollama pull nomic-embed-text
-#   - Ollama running:  ollama serve
+#   - Ollama installed:    brew install ollama
+#   - socat installed:     brew install socat
+#   - Model pulled:        ollama pull nomic-embed-text
 #
 # USAGE:
-#   make -f Makefile.mac start        — start Ollama + Enrich Service (one shot)
-#   make -f Makefile.mac stop         — stop Ollama + Enrich Service
-#   make -f Makefile.mac health       — check if the Enrich Service is responding
-#   make -f Makefile.mac ollama-serve — start Ollama in foreground (debugging only)
+#   make -f Makefile.mac start        — start socat bridge + Enrich Service (one shot)
+#   make -f Makefile.mac stop         — stop socat bridge + Enrich Service
+#   make -f Makefile.mac health       — check Enrich Service + Ollama network reachability
 #
 # EXECUTION ORDER (after Windows 'make setup' completes):
-#   1. make -f Makefile.mac start
-#   2. export PF_POSTGRES_PASSWORD=etl_pass
-#   3. export ENRICH_SERVICE_URL=http://localhost:8765
-#   4. Start flows: pid=34 → pid=35 → pid=32
+#   1. ollama serve                   (in a separate terminal, or via Ollama.app)
+#   2. make -f Makefile.mac start
+#   3. export PF_POSTGRES_PASSWORD=etl_pass
+#   4. export ENRICH_SERVICE_URL=http://localhost:8765
+#   5. Start flows: pid=34 → pid=35 → pid=32
 
-ENRICH_PORT ?= 8765
-OLLAMA_URL  ?= http://localhost:11434
-TMPDIR      ?= /tmp/pf_case5
+ENRICH_PORT  ?= 8765
+OLLAMA_PORT  ?= 11434
+OLLAMA_URL   ?= http://localhost:$(OLLAMA_PORT)
+TMPDIR       ?= /tmp/pf_case5
 
-.PHONY: start stop ollama-serve enrich enrich-stop health
+.PHONY: start stop enrich enrich-stop socat-start socat-stop health
 
 $(TMPDIR):
 	mkdir -p $(TMPDIR)
 
-## Start Ollama + Enrich Service in one shot
-start: enrich-stop $(TMPDIR)
-	@echo ">>> Starting Ollama on 0.0.0.0:11434..."
-	@OLLAMA_HOST=0.0.0.0 ollama serve > $(TMPDIR)/ollama.log 2>&1 & echo $$! > $(TMPDIR)/ollama.pid
-	@MAC_IP=$$(ipconfig getifaddr en0); \
-	echo "  Waiting for Ollama at $$MAC_IP:11434..."; \
-	for i in $$(seq 1 20); do \
-		curl -sf http://$$MAC_IP:11434 > /dev/null 2>&1 && break; \
-		printf "."; sleep 2; \
-	done; \
-	curl -sf --max-time 3 http://$$MAC_IP:11434 > /dev/null 2>&1 \
-		&& echo "  ✓ Ollama ready at $$MAC_IP:11434" \
-		|| { echo "  ✗ Ollama NOT accessible at $$MAC_IP:11434 — macOS firewall may be blocking port 11434"; \
-		     echo "    Fix: System Settings → Privacy & Security → Firewall → allow ollama"; \
+## Start socat network bridge + Enrich Service in one shot
+## (Ollama must already be running: ollama serve, or via Ollama.app)
+start: stop $(TMPDIR)
+	@echo ">>> Checking Ollama is running locally..."
+	@curl -sf http://localhost:$(OLLAMA_PORT) > /dev/null 2>&1 \
+		|| { echo "  ✗ Ollama not running on localhost:$(OLLAMA_PORT)"; \
+		     echo "    Start it first: ollama serve  (or open Ollama.app)"; \
 		     exit 1; }
+	@echo "  ✓ Ollama running on localhost:$(OLLAMA_PORT)"
+	@$(MAKE) -f Makefile.mac socat-start
 	@$(MAKE) -f Makefile.mac enrich
 
-## Start Ollama bound to all interfaces so Windows can reach it (foreground — for debugging)
-ollama-serve:
-	@echo ">>> Starting Ollama on 0.0.0.0:11434..."
-	OLLAMA_HOST=0.0.0.0 ollama serve
+## Expose Ollama to the LAN via socat (0.0.0.0:11434 → localhost:11434)
+socat-start: $(TMPDIR)
+	@MAC_IP=$$(ipconfig getifaddr en0); \
+	echo ">>> Bridging 0.0.0.0:$(OLLAMA_PORT) → localhost:$(OLLAMA_PORT) via socat..."; \
+	socat TCP-LISTEN:$(OLLAMA_PORT),bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:$(OLLAMA_PORT) \
+		> $(TMPDIR)/socat.log 2>&1 & echo $$! > $(TMPDIR)/socat.pid; \
+	sleep 1; \
+	curl -sf --max-time 3 http://$$MAC_IP:$(OLLAMA_PORT) > /dev/null 2>&1 \
+		&& echo "  ✓ Ollama accessible on LAN at $$MAC_IP:$(OLLAMA_PORT)" \
+		|| { echo "  ✗ socat bridge failed — check $(TMPDIR)/socat.log"; exit 1; }
+
+## Stop socat bridge
+socat-stop:
+	@if [ -f $(TMPDIR)/socat.pid ]; then \
+		PID=$$(cat $(TMPDIR)/socat.pid); \
+		kill $$PID 2>/dev/null \
+			&& echo ">>> socat bridge (PID $$PID) stopped" \
+			|| echo ">>> socat already stopped"; \
+		rm -f $(TMPDIR)/socat.pid; \
+	else \
+		echo ">>> socat not running"; \
+	fi
 
 ## Build and start the Mac Enrich Service in the background
 enrich: enrich-stop $(TMPDIR)
 	@echo ">>> Building Mac Enrich Service..."
 	go build -o $(TMPDIR)/mac_enrich_service ./cmd/mac_enrich_service
 	@echo ">>> Starting Mac Enrich Service on :$(ENRICH_PORT)..."
-	ENRICH_PORT=$(ENRICH_PORT) OLLAMA_URL=$(OLLAMA_URL) \
-	  $(TMPDIR)/mac_enrich_service & echo $$! > $(TMPDIR)/enrich.pid
+	@ENRICH_PORT=$(ENRICH_PORT) OLLAMA_URL=$(OLLAMA_URL) \
+		$(TMPDIR)/mac_enrich_service > $(TMPDIR)/enrich.log 2>&1 & echo $$! > $(TMPDIR)/enrich.pid
 	@echo "  PID: $$(cat $(TMPDIR)/enrich.pid)"
 	@sleep 2
 	@$(MAKE) -f Makefile.mac health
 
-## Stop Ollama + Enrich Service
-stop: enrich-stop
-	@if [ -f $(TMPDIR)/ollama.pid ]; then \
-		PID=$$(cat $(TMPDIR)/ollama.pid); \
-		kill $$PID 2>/dev/null \
-			&& echo ">>> Ollama (PID $$PID) stopped" \
-			|| echo ">>> Ollama already stopped"; \
-		rm -f $(TMPDIR)/ollama.pid; \
-	else \
-		echo ">>> Ollama not running"; \
-	fi
+## Stop socat bridge + Enrich Service
+stop: socat-stop enrich-stop
 
 ## Stop the Mac Enrich Service
 enrich-stop:
@@ -86,8 +91,12 @@ enrich-stop:
 		echo ">>> No enrich service running"; \
 	fi
 
-## Health-check the running service
+## Health-check: Enrich Service response + Ollama LAN reachability
 health:
-	@curl -sf http://localhost:$(ENRICH_PORT)/health \
-		&& echo ">>> Mac Enrich Service healthy" \
-		|| echo ">>> WARNING: health check failed"
+	@MAC_IP=$$(ipconfig getifaddr en0); \
+	curl -sf http://localhost:$(ENRICH_PORT)/health \
+		&& echo "  ✓ Enrich Service healthy at localhost:$(ENRICH_PORT)" \
+		|| echo "  ✗ Enrich Service not responding"; \
+	curl -sf --max-time 3 http://$$MAC_IP:$(OLLAMA_PORT) > /dev/null 2>&1 \
+		&& echo "  ✓ Ollama reachable on LAN at $$MAC_IP:$(OLLAMA_PORT)" \
+		|| echo "  ✗ Ollama NOT reachable on LAN at $$MAC_IP:$(OLLAMA_PORT)"
