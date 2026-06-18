@@ -9,16 +9,16 @@
 #   - Ollama running:  ollama serve
 #
 # USAGE:
-#   make -f Makefile.mac enrich       — build + start the Mac Enrich Service on :8765
-#   make -f Makefile.mac enrich-stop  — stop the Mac Enrich Service
-#   make -f Makefile.mac health       — check if the service is responding
+#   make -f Makefile.mac start        — start Ollama + Enrich Service (one shot)
+#   make -f Makefile.mac stop         — stop Ollama + Enrich Service
+#   make -f Makefile.mac health       — check if the Enrich Service is responding
+#   make -f Makefile.mac ollama-serve — start Ollama in foreground (debugging only)
 #
 # EXECUTION ORDER (after Windows 'make setup' completes):
-#   1. ollama serve                          (in a separate terminal)
-#   2. make -f Makefile.mac enrich
-#   3. export PF_POSTGRES_PASSWORD=etl_pass
-#   4. export ENRICH_SERVICE_URL=http://localhost:8765
-#   5. Start flows: pid=34 → pid=35 → pid=32
+#   1. make -f Makefile.mac start
+#   2. export PF_POSTGRES_PASSWORD=etl_pass
+#   3. export ENRICH_SERVICE_URL=http://localhost:8765
+#   4. Start flows: pid=34 → pid=35 → pid=32
 
 ENRICH_PORT ?= 8765
 OLLAMA_URL  ?= http://localhost:11434
@@ -33,12 +33,17 @@ $(TMPDIR):
 start: enrich-stop $(TMPDIR)
 	@echo ">>> Starting Ollama on 0.0.0.0:11434..."
 	@OLLAMA_HOST=0.0.0.0 ollama serve > $(TMPDIR)/ollama.log 2>&1 & echo $$! > $(TMPDIR)/ollama.pid
-	@echo "  Waiting for Ollama..."
-	@for i in $$(seq 1 20); do \
-		curl -sf http://localhost:11434 > /dev/null 2>&1 && break; \
-		sleep 2; \
-	done
-	@echo "  ✓ Ollama ready"
+	@MAC_IP=$$(ipconfig getifaddr en0); \
+	echo "  Waiting for Ollama at $$MAC_IP:11434..."; \
+	for i in $$(seq 1 20); do \
+		curl -sf http://$$MAC_IP:11434 > /dev/null 2>&1 && break; \
+		printf "."; sleep 2; \
+	done; \
+	curl -sf --max-time 3 http://$$MAC_IP:11434 > /dev/null 2>&1 \
+		&& echo "  ✓ Ollama ready at $$MAC_IP:11434" \
+		|| { echo "  ✗ Ollama NOT accessible at $$MAC_IP:11434 — macOS firewall may be blocking port 11434"; \
+		     echo "    Fix: System Settings → Privacy & Security → Firewall → allow ollama"; \
+		     exit 1; }
 	@$(MAKE) -f Makefile.mac enrich
 
 ## Start Ollama bound to all interfaces so Windows can reach it (foreground — for debugging)

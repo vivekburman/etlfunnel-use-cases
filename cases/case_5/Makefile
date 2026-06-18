@@ -136,6 +136,14 @@ ping-mac:
 		&& echo "  ✓ Enrich Service reachable at $(ENRICH_URL)" \
 		|| echo "  ✗ Enrich Service NOT reachable at $(ENRICH_URL)"
 
+## Wipe AuxDB checkpoint/cursor/offset state for a clean pipeline re-run
+clean-checkpoints:
+	@echo ">>> Clearing AuxDB pipeline state..."
+	@docker exec pf_auxdb psql -U etl_user -d auxdb -c \
+		"TRUNCATE pf_catalog_checkpoints, pf_enrich_collect_cursors, pf_enrich_submit_offsets, \
+		          pf_postgres_ingest_backlog, pf_enrich_submit_backlog, pf_es_index_backlog RESTART IDENTITY CASCADE;"
+	@echo "  ✓ Checkpoints cleared — pipeline will re-process from scratch"
+
 ## Tail container logs
 logs:
 	docker compose -f $(COMPOSE_FILE) logs -f
