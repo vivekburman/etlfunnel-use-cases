@@ -13,16 +13,19 @@
 #   - Docker Desktop running
 #
 # USAGE (run on Windows):
-#   make up           — start AuxDB + Postgres source + Kafka + Elasticsearch
-#   make deps         — download Go module dependencies
-#   make auxdb        — create AuxDB checkpoint/backlog tables (run once after 'up')
-#   make es-index     — create Elasticsearch pf_products index with dense_vector (run once)
-#   make seed         — insert 200 test products into Postgres source DB
-#   make setup        — full bootstrap: up → auxdb → es-index → seed
-#   make logs         — tail all container logs
-#   make status       — show container health
-#   make down         — stop containers (keep volumes)
-#   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make up                — start AuxDB + Postgres source + Kafka + Elasticsearch
+#   make deps              — download Go module dependencies
+#   make auxdb             — create AuxDB checkpoint/backlog tables (run once after 'up')
+#   make es-index          — create Elasticsearch pf_products index with dense_vector (run once)
+#   make seed              — one-shot: insert 200 products into Postgres (initial bootstrap only)
+#   make seed-hot          — continuous: keep inserting new products into Postgres (run alongside ETL)
+#   make oracle-seed-hot   — continuous: keep inserting new rows into Oracle PRODUCT_ATTRS (run alongside ETL)
+#   make seeds-hot         — continuous: run both Postgres + Oracle seeders in parallel (Ctrl-C stops both)
+#   make setup             — full bootstrap: up → auxdb → es-index → seed
+#   make logs              — tail all container logs
+#   make status            — show container health
+#   make down              — stop containers (keep volumes)
+#   make reset             — stop containers AND destroy volumes (DESTRUCTIVE)
 #
 # PIPELINE ENV VARS (set in PowerShell before running flows):
 #   $$env:PF_POSTGRES_PASSWORD = "etl_pass"
@@ -31,8 +34,10 @@
 #
 # EXECUTION ORDER:
 #   [Windows] make setup
-#   [Mac]     make -f Makefile.mac enrich
-#   [Mac]     Start flows: pid=34 → pid=35 → pid=32
+#   [Mac]     make -f Makefile.mac start
+#   [Windows] make seed-hot          (terminal 1 — continuous Postgres feed)
+#   [Windows] make oracle-seed-hot   (terminal 2 — continuous Oracle feed)
+#   [Windows] Start flows: pid=34 → pid=35 → pid=32
 
 SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -euo pipefail -c
@@ -52,9 +57,13 @@ MAC_IP          ?= 192.168.1.41
 OLLAMA_URL      ?= http://$(MAC_IP):11434
 ENRICH_URL      ?= http://$(MAC_IP):8765
 SEED_N          ?= 200
+HOT_BATCH       ?= 20
+HOT_INTERVAL    ?= 5s
+ORACLE_HOT_BATCH     ?= 10
+ORACLE_HOT_INTERVAL  ?= 5s
 COLLECTION_JSON ?= C:/Users/vivek/streamcraftexecution/collection.json
 
-.PHONY: up down reset wait-healthy deps auxdb es-index seed setup oracle-pull oracle-run oracle-schema oracle-seed oracle-setup logs status ping-mac patch-collection
+.PHONY: up down reset wait-healthy deps auxdb es-index seed seed-hot seeds-hot setup oracle-pull oracle-run oracle-schema oracle-seed oracle-seed-hot oracle-setup logs status ping-mac patch-collection
 
 ## Start all containers
 up:
@@ -105,21 +114,37 @@ es-index:
 	go run ./cmd/es_schema --es=$(ES_URL)
 	@echo ">>> Elasticsearch index ready"
 
-## Seed Postgres source DB with synthetic product records
+## Seed Postgres source DB with synthetic product records (one-shot, for initial bootstrap)
 seed:
 	@echo ">>> Seeding Postgres pf_catalog with $(SEED_N) products..."
 	go run ./cmd/seeder -dsn "$(POSTGRES_SRC_DSN)" -n $(SEED_N)
 	@echo ">>> Seed complete"
 
-## Full bootstrap: start containers → create AuxDB tables → create ES index → seed Postgres
+## Continuously insert new products into Postgres (run alongside the ETL pipelines)
+seed-hot:
+	@echo ">>> Starting continuous Postgres seeder (batch=$(HOT_BATCH), interval=$(HOT_INTERVAL))..."
+	@echo ">>> Ctrl-C to stop."
+	go run ./cmd/hot_seeder --dsn "$(POSTGRES_SRC_DSN)" --batch $(HOT_BATCH) --interval $(HOT_INTERVAL)
+
+## Run both Postgres and Oracle hot seeders in parallel (Ctrl-C stops both)
+seeds-hot:
+	@echo ">>> Starting both hot seeders in parallel (Ctrl-C stops both)..."
+	@go run ./cmd/hot_seeder --dsn "$(POSTGRES_SRC_DSN)" --batch $(HOT_BATCH) --interval $(HOT_INTERVAL) & \
+	go run ./cmd/oracle_seeder -host localhost -port 1521 -service XEPDB1 \
+		-user etl_user -password $(ORACLE_PWD) \
+		--batch $(ORACLE_HOT_BATCH) --interval $(ORACLE_HOT_INTERVAL) & \
+	wait
+
+## Full bootstrap: start containers → create AuxDB tables → create ES index → initial Postgres seed
 setup: up auxdb es-index seed
 	@echo ""
-	@echo ">>> Setup complete. Next steps (on Mac):"
-	@echo "   1. ollama serve"
-	@echo "   2. make -f Makefile.mac enrich"
-	@echo "   3. export PF_POSTGRES_PASSWORD=etl_pass ENRICH_SERVICE_URL=http://localhost:8765"
-	@echo "   4. Start flows: pid=34 → pid=35 → pid=32"
-	@echo "   5. Verify ES:   curl http://$(ES_URL)/pf_products/_count"
+	@echo ">>> Setup complete. Next steps:"
+	@echo "   [Mac]     ollama serve"
+	@echo "   [Mac]     make -f Makefile.mac start"
+	@echo "   [Windows] make seeds-hot         — continuous Postgres + Oracle feed (keep running)"
+	@echo "   [Windows] export PF_POSTGRES_PASSWORD=etl_pass"
+	@echo "   [Windows] Start flows: pid=34 → pid=35 → pid=32"
+	@echo "   [Windows] Verify ES:   curl http://$(ES_URL)/pf_products/_count"
 
 ## ── Oracle (Flow 33 source — manual license required) ──────────────────────
 ##
@@ -184,19 +209,21 @@ oracle-schema:
 		| docker exec -i pf_oracle sqlplus -S etl_user/$(ORACLE_PWD)@//localhost:1521/XEPDB1
 	@echo "  ✓ Oracle schema ready"
 
-## Seed Oracle PRODUCT_ATTRS with synthetic ERP rows
-oracle-seed:
-	@echo ">>> Seeding Oracle PRODUCT_ATTRS..."
+## Continuously insert new rows into Oracle PRODUCT_ATTRS (run alongside the ETL pipelines)
+oracle-seed-hot:
+	@echo ">>> Starting continuous Oracle seeder (batch=$(ORACLE_HOT_BATCH), interval=$(ORACLE_HOT_INTERVAL))..."
+	@echo ">>> Ctrl-C to stop."
 	go run ./cmd/oracle_seeder -host localhost -port 1521 -service XEPDB1 \
-		-user etl_user -password $(ORACLE_PWD) -n 50
-	@echo "  ✓ Oracle seed complete"
+		-user etl_user -password $(ORACLE_PWD) \
+		--batch $(ORACLE_HOT_BATCH) --interval $(ORACLE_HOT_INTERVAL)
 
-## Full Oracle bootstrap: run container → create schema → seed data
-oracle-setup: oracle-run oracle-schema oracle-seed
+## Full Oracle bootstrap: run container → create schema (seed via 'make oracle-seed-hot' separately)
+oracle-setup: oracle-run oracle-schema
 	@echo ""
 	@echo ">>> Oracle setup complete."
 	@echo "   Set env var before running flows: $$env:PF_ORACLE_PASSWORD=$(ORACLE_PWD)"
 	@echo "   Flow 33 (pid=33) reads from etl_user.PRODUCT_ATTRS on localhost:1521/XEPDB1"
+	@echo "   Run 'make oracle-seed-hot' in a separate terminal to continuously feed new rows."
 
 ## ────────────────────────────────────────────────────────────────────────────
 

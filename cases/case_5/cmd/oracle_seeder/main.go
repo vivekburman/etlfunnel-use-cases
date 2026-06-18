@@ -1,12 +1,20 @@
 package main
 
-// Oracle PRODUCT_ATTRS seeder — inserts synthetic ERP product rows into
-// the Oracle XE source database so Flow 33 has data to process.
+// oracle_seeder — continuous ERP product attribute generator for Oracle XE.
+//
+// Queries the current max PRODUCT_ID on startup to find the offset, then
+// inserts a fresh batch of new PRODUCT_ATTRS rows every tick so Flow 33
+// (Oracle → Kafka) has a steady stream of incremental rows to process.
 //
 // USAGE:
-//   go run ./cmd/oracle_seeder -host localhost -port 1521 -service XEPDB1 \
-//     -user etl_user -password etl_pass -n 50
-//   make oracle-seed
+//   go run ./cmd/oracle_seeder
+//   go run ./cmd/oracle_seeder --batch 10 --interval 5s
+//   make oracle-seed-hot
+//
+// FLAGS:
+//   --batch      rows inserted per tick  (default 10)
+//   --interval   pause between ticks    (default 5s)
+//   --host, --port, --service, --user, --password
 
 import (
 	"database/sql"
@@ -14,6 +22,10 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	go_ora "github.com/sijms/go-ora/v2"
 )
@@ -24,7 +36,8 @@ var (
 	flagService  = flag.String("service", "XEPDB1", "Oracle service name")
 	flagUser     = flag.String("user", "etl_user", "Oracle username")
 	flagPassword = flag.String("password", "etl_pass", "Oracle password")
-	flagN        = flag.Int("n", 50, "number of rows to insert")
+	flagBatch    = flag.Int("batch", 10, "rows inserted per tick")
+	flagInterval = flag.Duration("interval", 5*time.Second, "pause between ticks")
 )
 
 var (
@@ -35,6 +48,7 @@ var (
 
 func main() {
 	flag.Parse()
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
 	connStr := go_ora.BuildUrl(*flagHost, *flagPort, *flagService, *flagUser, *flagPassword, nil)
@@ -48,23 +62,59 @@ func main() {
 		log.Fatalf("ping oracle: %v", err)
 	}
 
-	log.Println("=== Oracle PRODUCT_ATTRS Seeder ===")
-	log.Printf("  target:   %s@%s:%d/%s", *flagUser, *flagHost, *flagPort, *flagService)
-	log.Printf("  rows:     %d", *flagN)
-
-	inserted, err := insertRows(db, *flagN)
+	offset, err := currentMaxOffset(db)
 	if err != nil {
-		log.Fatalf("insert: %v", err)
+		log.Fatalf("read max offset: %v", err)
 	}
-	log.Printf("=== Seeder complete — %d rows inserted ===", inserted)
+
+	log.Println("=== Oracle Hot Seeder — continuous ERP product generator ===")
+	log.Printf("  target:   %s@%s:%d/%s", *flagUser, *flagHost, *flagPort, *flagService)
+	log.Printf("  batch:    %d rows/tick", *flagBatch)
+	log.Printf("  interval: %s", *flagInterval)
+	log.Printf("  offset:   starting from PF-%06d", offset+1)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	ticker := time.NewTicker(*flagInterval)
+	defer ticker.Stop()
+
+	tick := 0
+	totalInserted := 0
+
+	for {
+		select {
+		case <-stop:
+			log.Printf("=== Oracle Hot Seeder stopped — %d rows inserted across %d ticks ===",
+				totalInserted, tick)
+			return
+		case <-ticker.C:
+			tick++
+			n, err := insertBatch(db, rng, &offset, *flagBatch)
+			if err != nil {
+				log.Printf("tick #%d insert error: %v", tick, err)
+				continue
+			}
+			totalInserted += n
+			log.Printf("tick #%d — inserted %d rows (total: %d, next: PF-%06d)",
+				tick, n, totalInserted, offset+1)
+		}
+	}
 }
 
-func insertRows(db *sql.DB, n int) (int, error) {
-	rng := rand.New(rand.NewSource(99))
-	inserted := 0
+func currentMaxOffset(db *sql.DB) (int, error) {
+	var max int
+	err := db.QueryRow(
+		`SELECT NVL(MAX(TO_NUMBER(SUBSTR(PRODUCT_ID, 4))), 99999) FROM PRODUCT_ATTRS`,
+	).Scan(&max)
+	return max, err
+}
 
+func insertBatch(db *sql.DB, rng *rand.Rand, offset *int, n int) (int, error) {
+	inserted := 0
 	for i := 0; i < n; i++ {
-		productID := fmt.Sprintf("PF-%06d", 100000+i)
+		*offset++
+		productID := fmt.Sprintf("PF-%06d", *offset)
 		skuCode := fmt.Sprintf("SKU-%s-%04d", suppliers[rng.Intn(len(suppliers))], rng.Intn(9999))
 		supplierID := suppliers[rng.Intn(len(suppliers))]
 		weightKg := 5.0 + rng.Float64()*95.0
@@ -91,6 +141,5 @@ func insertRows(db *sql.DB, n int) (int, error) {
 		}
 		inserted++
 	}
-	log.Printf("  ✓ %d rows upserted into PRODUCT_ATTRS", inserted)
 	return inserted, nil
 }
