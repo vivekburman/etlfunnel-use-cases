@@ -4,9 +4,8 @@
 # ============================================================
 #
 # PREREQUISITES:
-#   - Ollama installed:    brew install ollama
-#   - Model pulled:        ollama pull nomic-embed-text
-#   (socat is installed automatically by 'make -f Makefile.mac start')
+#   - Homebrew installed (https://brew.sh)
+#   (socat, ollama, and nomic-embed-text are installed automatically by 'make -f Makefile.mac start')
 #
 # USAGE:
 #   make -f Makefile.mac start        — install deps, start Ollama + socat bridge + Enrich Service
@@ -28,93 +27,100 @@ TMPDIR       ?= /tmp/pf_case5
 .PHONY: start stop deps enrich enrich-stop socat-start socat-stop health
 
 $(TMPDIR):
-	mkdir -p $(TMPDIR)
+  mkdir -p $(TMPDIR)
 
-## Install Mac dependencies (socat via brew)
+## Install Mac dependencies (socat + ollama via brew, pull nomic-embed-text)
 deps:
-	@command -v socat > /dev/null 2>&1 \
-		|| { echo ">>> Installing socat..."; brew install socat; }
-	@echo "  ✓ socat ready"
+  @command -v socat > /dev/null 2>&1 \
+    || { echo ">>> Installing socat..."; brew install socat; }
+  @echo "  ✓ socat ready"
+  @command -v ollama > /dev/null 2>&1 \
+    || { echo ">>> Installing ollama..."; brew install ollama; }
+  @echo "  ✓ ollama ready"
 
 ## Start Ollama + socat network bridge + Enrich Service in one shot
 start: stop deps $(TMPDIR)
-	@echo ">>> Starting Ollama in background..."
-	@ollama serve > $(TMPDIR)/ollama.log 2>&1 & echo $$! > $(TMPDIR)/ollama.pid
-	@echo "  Waiting for Ollama on localhost:$(OLLAMA_PORT)..."
-	@for i in $$(seq 1 20); do \
-		curl -sf http://localhost:$(OLLAMA_PORT) > /dev/null 2>&1 && break; \
-		printf "."; sleep 2; \
-	done
-	@curl -sf http://localhost:$(OLLAMA_PORT) > /dev/null 2>&1 \
-		&& echo "  ✓ Ollama running on localhost:$(OLLAMA_PORT)" \
-		|| { echo "  ✗ Ollama failed to start — check $(TMPDIR)/ollama.log"; exit 1; }
-	@$(MAKE) -f Makefile.mac socat-start
-	@$(MAKE) -f Makefile.mac enrich
+  @echo ">>> Starting Ollama in background..."
+  @ollama serve > $(TMPDIR)/ollama.log 2>&1 & echo $$! > $(TMPDIR)/ollama.pid
+  @echo "  Waiting for Ollama on localhost:$(OLLAMA_PORT)..."
+  @for i in $$(seq 1 20); do \
+    curl -sf http://localhost:$(OLLAMA_PORT) > /dev/null 2>&1 && break; \
+    printf "."; sleep 2; \
+  done
+  @curl -sf http://localhost:$(OLLAMA_PORT) > /dev/null 2>&1 \
+    && echo "  ✓ Ollama running on localhost:$(OLLAMA_PORT)" \
+    || { echo "  ✗ Ollama failed to start — check $(TMPDIR)/ollama.log"; exit 1; }
+  @ollama list 2>/dev/null | grep -q "nomic-embed-text" \
+    || { echo ">>> Pulling nomic-embed-text model..."; ollama pull nomic-embed-text; }
+  @echo "  ✓ nomic-embed-text model ready"
+  @$(MAKE) -f Makefile.mac socat-start
+  @$(MAKE) -f Makefile.mac enrich
 
 ## Expose Ollama to the LAN via socat (0.0.0.0:11434 → localhost:11434)
 socat-start: $(TMPDIR)
-	@MAC_IP=$$(ipconfig getifaddr en0); \
-	echo ">>> Bridging 0.0.0.0:$(OLLAMA_PORT) → localhost:$(OLLAMA_PORT) via socat..."; \
-	socat TCP-LISTEN:$(OLLAMA_PORT),bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:$(OLLAMA_PORT) \
-		> $(TMPDIR)/socat.log 2>&1 & echo $$! > $(TMPDIR)/socat.pid; \
-	sleep 1; \
-	curl -sf --max-time 3 http://$$MAC_IP:$(OLLAMA_PORT) > /dev/null 2>&1 \
-		&& echo "  ✓ Ollama accessible on LAN at $$MAC_IP:$(OLLAMA_PORT)" \
-		|| { echo "  ✗ socat bridge failed — check $(TMPDIR)/socat.log"; exit 1; }
+  @MAC_IP=$$(ipconfig getifaddr en0); \
+  echo ">>> Bridging 0.0.0.0:$(OLLAMA_PORT) → localhost:$(OLLAMA_PORT) via socat..."; \
+  socat TCP-LISTEN:$(OLLAMA_PORT),bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:$(OLLAMA_PORT) \
+    > $(TMPDIR)/socat.log 2>&1 & echo $$! > $(TMPDIR)/socat.pid; \
+  sleep 1; \
+  curl -sf --max-time 3 http://$$MAC_IP:$(OLLAMA_PORT) > /dev/null 2>&1 \
+    && echo "  ✓ Ollama accessible on LAN at $$MAC_IP:$(OLLAMA_PORT)" \
+    || { echo "  ✗ socat bridge failed — check $(TMPDIR)/socat.log"; exit 1; }
 
 ## Stop socat bridge
 socat-stop:
-	@if [ -f $(TMPDIR)/socat.pid ]; then \
-		PID=$$(cat $(TMPDIR)/socat.pid); \
-		kill $$PID 2>/dev/null \
-			&& echo ">>> socat bridge (PID $$PID) stopped" \
-			|| echo ">>> socat already stopped"; \
-		rm -f $(TMPDIR)/socat.pid; \
-	else \
-		echo ">>> socat not running"; \
-	fi
+  @if [ -f $(TMPDIR)/socat.pid ]; then \
+    PID=$$(cat $(TMPDIR)/socat.pid); \
+    kill $$PID 2>/dev/null \
+      && echo ">>> socat bridge (PID $$PID) stopped" \
+      || echo ">>> socat already stopped"; \
+    rm -f $(TMPDIR)/socat.pid; \
+  else \
+    echo ">>> socat not running"; \
+  fi
 
 ## Build and start the Mac Enrich Service in the background
 enrich: enrich-stop $(TMPDIR)
-	@echo ">>> Building Mac Enrich Service..."
-	go build -o $(TMPDIR)/mac_enrich_service ./cmd/mac_enrich_service
-	@echo ">>> Starting Mac Enrich Service on :$(ENRICH_PORT)..."
-	@ENRICH_PORT=$(ENRICH_PORT) OLLAMA_URL=$(OLLAMA_URL) \
-		$(TMPDIR)/mac_enrich_service > $(TMPDIR)/enrich.log 2>&1 & echo $$! > $(TMPDIR)/enrich.pid
-	@echo "  PID: $$(cat $(TMPDIR)/enrich.pid)"
-	@sleep 2
-	@$(MAKE) -f Makefile.mac health
+  @echo ">>> Building Mac Enrich Service..."
+  go build -o $(TMPDIR)/mac_enrich_service ./cmd/mac_enrich_service
+  @echo ">>> Starting Mac Enrich Service on :$(ENRICH_PORT)..."
+  @ENRICH_PORT=$(ENRICH_PORT) OLLAMA_URL=$(OLLAMA_URL) \
+    $(TMPDIR)/mac_enrich_service > $(TMPDIR)/enrich.log 2>&1 & echo $$! > $(TMPDIR)/enrich.pid
+  @echo "  PID: $$(cat $(TMPDIR)/enrich.pid)"
+  @sleep 2
+  @$(MAKE) -f Makefile.mac health
 
 ## Stop Ollama + socat bridge + Enrich Service
 stop: socat-stop enrich-stop
-	@if [ -f $(TMPDIR)/ollama.pid ]; then \
-		PID=$$(cat $(TMPDIR)/ollama.pid); \
-		kill $$PID 2>/dev/null \
-			&& echo ">>> Ollama (PID $$PID) stopped" \
-			|| echo ">>> Ollama already stopped"; \
-		rm -f $(TMPDIR)/ollama.pid; \
-	else \
-		echo ">>> Ollama not running"; \
-	fi
+  @if [ -f $(TMPDIR)/ollama.pid ]; then \
+    PID=$$(cat $(TMPDIR)/ollama.pid); \
+    kill $$PID 2>/dev/null \
+      && echo ">>> Ollama (PID $$PID) stopped" \
+      || echo ">>> Ollama already stopped"; \
+    rm -f $(TMPDIR)/ollama.pid; \
+  else \
+    echo ">>> Ollama not running"; \
+  fi
 
 ## Stop the Mac Enrich Service
 enrich-stop:
-	@if [ -f $(TMPDIR)/enrich.pid ]; then \
-		PID=$$(cat $(TMPDIR)/enrich.pid); \
-		kill $$PID 2>/dev/null \
-			&& echo ">>> Enrich Service (PID $$PID) stopped" \
-			|| echo ">>> Enrich Service already stopped"; \
-		rm -f $(TMPDIR)/enrich.pid; \
-	else \
-		echo ">>> No enrich service running"; \
-	fi
+  @if [ -f $(TMPDIR)/enrich.pid ]; then \
+    PID=$$(cat $(TMPDIR)/enrich.pid); \
+    kill $$PID 2>/dev/null \
+      && echo ">>> Enrich Service (PID $$PID) stopped" \
+      || echo ">>> Enrich Service already stopped"; \
+    rm -f $(TMPDIR)/enrich.pid; \
+  else \
+    echo ">>> No enrich service running"; \
+  fi
 
 ## Health-check: Enrich Service response + Ollama LAN reachability
 health:
-	@MAC_IP=$$(ipconfig getifaddr en0); \
-	curl -sf http://localhost:$(ENRICH_PORT)/health \
-		&& echo "  ✓ Enrich Service healthy at localhost:$(ENRICH_PORT)" \
-		|| echo "  ✗ Enrich Service not responding"; \
-	curl -sf --max-time 3 http://$$MAC_IP:$(OLLAMA_PORT) > /dev/null 2>&1 \
-		&& echo "  ✓ Ollama reachable on LAN at $$MAC_IP:$(OLLAMA_PORT)" \
-		|| echo "  ✗ Ollama NOT reachable on LAN at $$MAC_IP:$(OLLAMA_PORT)"
+  @MAC_IP=$$(ipconfig getifaddr en0); \
+  curl -sf http://localhost:$(ENRICH_PORT)/health \
+    && echo "  ✓ Enrich Service healthy at localhost:$(ENRICH_PORT)" \
+    || echo "  ✗ Enrich Service not responding"; \
+  curl -sf --max-time 3 http://$$MAC_IP:$(OLLAMA_PORT) > /dev/null 2>&1 \
+    && echo "  ✓ Ollama reachable on LAN at $$MAC_IP:$(OLLAMA_PORT)" \
+    || echo "  ✗ Ollama NOT reachable on LAN at $$MAC_IP:$(OLLAMA_PORT)"
+ 
