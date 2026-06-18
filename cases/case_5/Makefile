@@ -48,10 +48,13 @@ AUXDB_DSN       ?= postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=d
 POSTGRES_SRC_DSN ?= postgresql://etl_user:etl_pass@localhost:5433/pf_catalog?sslmode=disable
 ES_URL          ?= http://127.0.0.1:9200
 ENRICH_PORT     ?= 8765
-OLLAMA_URL      ?= http://localhost:11434
+MAC_IP          ?= 192.168.1.41
+OLLAMA_URL      ?= http://$(MAC_IP):11434
+ENRICH_URL      ?= http://$(MAC_IP):8765
 SEED_N          ?= 200
+COLLECTION_JSON ?= C:/Users/vivek/streamcraftexecution/collection.json
 
-.PHONY: up down reset wait-healthy deps auxdb es-index seed setup logs status
+.PHONY: up down reset wait-healthy deps auxdb es-index seed setup logs status ping-mac patch-collection
 
 ## Start all containers
 up:
@@ -117,6 +120,21 @@ setup: up auxdb es-index seed
 	@echo "   3. export PF_POSTGRES_PASSWORD=etl_pass ENRICH_SERVICE_URL=http://localhost:8765"
 	@echo "   4. Start flows: pid=34 → pid=35 → pid=32"
 	@echo "   5. Verify ES:   curl http://$(ES_URL)/pf_products/_count"
+
+## Patch collection.json with current MAC_IP and correct Postgres settings (re-run if Mac IP changes)
+patch-collection:
+	@echo ">>> Patching collection.json for MAC_IP=$(MAC_IP)..."
+	@sed -i 's|"baseURL": "http://[0-9.]*:8765"|"baseURL": "http://$(MAC_IP):8765"|g' "$(COLLECTION_JSON)"
+	@sed -i 's|"port": 5432, "sslMode": "disable", "database": "pepperfry"|"port": 5433, "sslMode": "disable", "database": "pf_catalog"|g' "$(COLLECTION_JSON)"
+	@echo "  ✓ Enrich Service URL → http://$(MAC_IP):8765"
+	@echo "  ✓ Postgres           → port=5433 database=pf_catalog"
+
+## Check Mac Enrich Service is reachable from Windows
+ping-mac:
+	@echo ">>> Pinging Mac Enrich Service at $(ENRICH_URL)..."
+	@curl --max-time 5 --connect-timeout 3 -sf "$(ENRICH_URL)/health" \
+		&& echo "  ✓ Enrich Service reachable at $(ENRICH_URL)" \
+		|| echo "  ✗ Enrich Service NOT reachable at $(ENRICH_URL)"
 
 ## Tail container logs
 logs:

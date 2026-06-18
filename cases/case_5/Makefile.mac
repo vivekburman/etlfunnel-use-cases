@@ -24,10 +24,27 @@ ENRICH_PORT ?= 8765
 OLLAMA_URL  ?= http://localhost:11434
 TMPDIR      ?= /tmp/pf_case5
 
-.PHONY: enrich enrich-stop health
+.PHONY: start stop ollama-serve enrich enrich-stop health
 
 $(TMPDIR):
 	mkdir -p $(TMPDIR)
+
+## Start Ollama + Enrich Service in one shot
+start: enrich-stop $(TMPDIR)
+	@echo ">>> Starting Ollama on 0.0.0.0:11434..."
+	@OLLAMA_HOST=0.0.0.0 ollama serve > $(TMPDIR)/ollama.log 2>&1 & echo $$! > $(TMPDIR)/ollama.pid
+	@echo "  Waiting for Ollama..."
+	@for i in $$(seq 1 20); do \
+		curl -sf http://localhost:11434 > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done
+	@echo "  ✓ Ollama ready"
+	@$(MAKE) -f Makefile.mac enrich
+
+## Start Ollama bound to all interfaces so Windows can reach it (foreground — for debugging)
+ollama-serve:
+	@echo ">>> Starting Ollama on 0.0.0.0:11434..."
+	OLLAMA_HOST=0.0.0.0 ollama serve
 
 ## Build and start the Mac Enrich Service in the background
 enrich: enrich-stop $(TMPDIR)
@@ -39,6 +56,18 @@ enrich: enrich-stop $(TMPDIR)
 	@echo "  PID: $$(cat $(TMPDIR)/enrich.pid)"
 	@sleep 2
 	@$(MAKE) -f Makefile.mac health
+
+## Stop Ollama + Enrich Service
+stop: enrich-stop
+	@if [ -f $(TMPDIR)/ollama.pid ]; then \
+		PID=$$(cat $(TMPDIR)/ollama.pid); \
+		kill $$PID 2>/dev/null \
+			&& echo ">>> Ollama (PID $$PID) stopped" \
+			|| echo ">>> Ollama already stopped"; \
+		rm -f $(TMPDIR)/ollama.pid; \
+	else \
+		echo ">>> Ollama not running"; \
+	fi
 
 ## Stop the Mac Enrich Service
 enrich-stop:
