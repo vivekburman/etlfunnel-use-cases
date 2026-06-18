@@ -51,7 +51,7 @@ COMPOSE_FILE := docker-compose.yml
 
 AUXDB_DSN       ?= postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 POSTGRES_SRC_DSN ?= postgresql://etl_user:etl_pass@localhost:5433/pf_catalog?sslmode=disable
-ES_URL          ?= http://localhost:9200
+ES_URL          ?= http://127.0.0.1:9200
 ENRICH_PORT     ?= 8765
 OLLAMA_URL      ?= http://localhost:11434
 SEED_N          ?= 200
@@ -105,33 +105,7 @@ auxdb:
 ## Create Elasticsearch pf_products index with dense_vector mapping (run once after 'up')
 es-index:
 	@echo ">>> Creating Elasticsearch pf_products index..."
-	curl -sf -X PUT "$(ES_URL)/pf_products" \
-	  -H "Content-Type: application/json" \
-	  -d '{ \
-	    "settings": { \
-	      "number_of_shards": 3, \
-	      "number_of_replicas": 1 \
-	    }, \
-	    "mappings": { \
-	      "properties": { \
-	        "product_id":  { "type": "keyword" }, \
-	        "title":       { "type": "text", "analyzer": "english" }, \
-	        "description": { "type": "text", "analyzer": "english" }, \
-	        "category":    { "type": "keyword" }, \
-	        "price":       { "type": "float" }, \
-	        "source":      { "type": "keyword" }, \
-	        "updated_at":  { "type": "date" }, \
-	        "enriched_at": { "type": "date" }, \
-	        "run_id":      { "type": "keyword" }, \
-	        "embedding": { \
-	          "type": "dense_vector", \
-	          "dims": 768, \
-	          "index": true, \
-	          "similarity": "cosine" \
-	        } \
-	      } \
-	    } \
-	  }' | python -m json.tool
+	go run ./cmd/es_schema --es=$(ES_URL)
 	@echo ">>> Elasticsearch index ready"
 
 ## Seed Postgres source DB with synthetic product records
@@ -147,7 +121,7 @@ enrich: enrich-stop
 	go run ./cmd/mac_enrich_service & echo $$! > .enrich.pid
 	@echo "  Enrich Service PID: $$(cat .enrich.pid)"
 	@sleep 2
-	@curl -sf http://localhost:$(ENRICH_PORT)/health && echo ">>> Mac Enrich Service healthy" || echo ">>> WARNING: health check failed"
+	@curl --ipv4 -sf http://127.0.0.1:$(ENRICH_PORT)/health && echo ">>> Mac Enrich Service healthy" || echo ">>> WARNING: health check failed"
 
 ## Stop the Mac Enrich Service
 enrich-stop:
