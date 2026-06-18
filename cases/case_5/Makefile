@@ -1,5 +1,6 @@
 # ============================================================
-# Pepperfry Product Catalog Enrichment Pipeline — Case 5 Setup Makefile
+# Pepperfry Product Catalog Enrichment Pipeline — Case 5
+# Windows Setup Makefile  (infrastructure only)
 # ============================================================
 #
 # ARCHITECTURE:
@@ -10,34 +11,28 @@
 #
 # PREREQUISITES:
 #   - Docker Desktop running
-#   - Ollama installed: brew install ollama
-#   - Model pulled: ollama pull nomic-embed-text
 #
-# USAGE:
+# USAGE (run on Windows):
 #   make up           — start AuxDB + Postgres source + Kafka + Elasticsearch
 #   make deps         — download Go module dependencies
 #   make auxdb        — create AuxDB checkpoint/backlog tables (run once after 'up')
 #   make es-index     — create Elasticsearch pf_products index with dense_vector (run once)
 #   make seed         — insert 200 test products into Postgres source DB
-#   make enrich       — start the Mac Enrich Service on :8765 (Ollama must be running)
-#   make enrich-stop  — stop the Mac Enrich Service
 #   make setup        — full bootstrap: up → auxdb → es-index → seed
 #   make logs         — tail all container logs
 #   make status       — show container health
 #   make down         — stop containers (keep volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
 #
-# PIPELINE ENV VARS (set before running streamcraftexecution):
+# PIPELINE ENV VARS (set in PowerShell before running flows):
 #   $$env:PF_POSTGRES_PASSWORD = "etl_pass"
 #   $$env:PF_ORACLE_PASSWORD   = "etl_pass"   (if running Flow 33)
-#   $$env:ENRICH_SERVICE_URL   = "http://localhost:8765"
+#   $$env:ENRICH_SERVICE_URL   = "http://<mac-ip>:8765"
 #
 # EXECUTION ORDER:
-#   1. make setup && make enrich
-#   2. Start Flow 34 (pid=34) — Kafka consumer must be up before producers
-#   3. Start Flow 35 (pid=35) — polls Mac service for results
-#   4. Start Flow 32 (pid=32) — Postgres ingest (finite)
-#   5. Start Flow 33 (pid=33) — Oracle ingest (finite, if Oracle is configured)
+#   [Windows] make setup
+#   [Mac]     make -f Makefile.mac enrich
+#   [Mac]     Start flows: pid=34 → pid=35 → pid=32
 
 SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -euo pipefail -c
@@ -56,8 +51,7 @@ ENRICH_PORT     ?= 8765
 OLLAMA_URL      ?= http://localhost:11434
 SEED_N          ?= 200
 
-.PHONY: up down reset wait-healthy deps auxdb es-index seed enrich enrich-stop \
-        setup logs status
+.PHONY: up down reset wait-healthy deps auxdb es-index seed setup logs status
 
 ## Start all containers
 up:
@@ -114,36 +108,15 @@ seed:
 	go run ./cmd/seeder -dsn "$(POSTGRES_SRC_DSN)" -n $(SEED_N)
 	@echo ">>> Seed complete"
 
-## Start the Mac Enrich Service (Ollama must already be running: ollama serve)
-enrich: enrich-stop
-	@echo ">>> Starting Mac Enrich Service on :$(ENRICH_PORT)..."
-	ENRICH_PORT=$(ENRICH_PORT) OLLAMA_URL=$(OLLAMA_URL) \
-	go run ./cmd/mac_enrich_service & echo $$! > .enrich.pid
-	@echo "  Enrich Service PID: $$(cat .enrich.pid)"
-	@sleep 2
-	@curl --ipv4 -sf http://127.0.0.1:$(ENRICH_PORT)/health && echo ">>> Mac Enrich Service healthy" || echo ">>> WARNING: health check failed"
-
-## Stop the Mac Enrich Service
-enrich-stop:
-	@if [ -f .enrich.pid ]; then \
-		PID=$$(cat .enrich.pid); \
-		kill $$PID 2>/dev/null && echo ">>> Enrich Service (PID $$PID) stopped" || echo ">>> Enrich Service already stopped"; \
-		rm -f .enrich.pid; \
-	else \
-		echo ">>> No enrich service PID file found"; \
-	fi
-
 ## Full bootstrap: start containers → create AuxDB tables → create ES index → seed Postgres
 setup: up auxdb es-index seed
 	@echo ""
-	@echo ">>> Setup complete. Next steps:"
-	@echo "   1. Start Ollama:              ollama serve"
-	@echo "   2. Start Enrich Service:      make enrich"
-	@echo "   3. Set env vars:"
-	@echo "      \$$env:PF_POSTGRES_PASSWORD = 'etl_pass'"
-	@echo "      \$$env:ENRICH_SERVICE_URL   = 'http://localhost:8765'"
-	@echo "   4. Start flows in order:      pid=34 → pid=35 → pid=32"
-	@echo "   5. Verify ES:                 curl http://localhost:9200/pf_products/_count"
+	@echo ">>> Setup complete. Next steps (on Mac):"
+	@echo "   1. ollama serve"
+	@echo "   2. make -f Makefile.mac enrich"
+	@echo "   3. export PF_POSTGRES_PASSWORD=etl_pass ENRICH_SERVICE_URL=http://localhost:8765"
+	@echo "   4. Start flows: pid=34 → pid=35 → pid=32"
+	@echo "   5. Verify ES:   curl http://$(ES_URL)/pf_products/_count"
 
 ## Tail container logs
 logs:

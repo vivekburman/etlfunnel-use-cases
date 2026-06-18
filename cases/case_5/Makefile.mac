@@ -1,0 +1,59 @@
+# ============================================================
+# Pepperfry Product Catalog Enrichment Pipeline — Case 5
+# Mac Makefile  (enrich service only — run on Mac)
+# ============================================================
+#
+# PREREQUISITES:
+#   - Ollama installed: brew install ollama
+#   - Model pulled:    ollama pull nomic-embed-text
+#   - Ollama running:  ollama serve
+#
+# USAGE:
+#   make -f Makefile.mac enrich       — build + start the Mac Enrich Service on :8765
+#   make -f Makefile.mac enrich-stop  — stop the Mac Enrich Service
+#   make -f Makefile.mac health       — check if the service is responding
+#
+# EXECUTION ORDER (after Windows 'make setup' completes):
+#   1. ollama serve                          (in a separate terminal)
+#   2. make -f Makefile.mac enrich
+#   3. export PF_POSTGRES_PASSWORD=etl_pass
+#   4. export ENRICH_SERVICE_URL=http://localhost:8765
+#   5. Start flows: pid=34 → pid=35 → pid=32
+
+ENRICH_PORT ?= 8765
+OLLAMA_URL  ?= http://localhost:11434
+TMPDIR      ?= /tmp/pf_case5
+
+.PHONY: enrich enrich-stop health
+
+$(TMPDIR):
+	mkdir -p $(TMPDIR)
+
+## Build and start the Mac Enrich Service in the background
+enrich: enrich-stop $(TMPDIR)
+	@echo ">>> Building Mac Enrich Service..."
+	go build -o $(TMPDIR)/mac_enrich_service ./cmd/mac_enrich_service
+	@echo ">>> Starting Mac Enrich Service on :$(ENRICH_PORT)..."
+	ENRICH_PORT=$(ENRICH_PORT) OLLAMA_URL=$(OLLAMA_URL) \
+	  $(TMPDIR)/mac_enrich_service & echo $$! > $(TMPDIR)/enrich.pid
+	@echo "  PID: $$(cat $(TMPDIR)/enrich.pid)"
+	@sleep 2
+	@$(MAKE) -f Makefile.mac health
+
+## Stop the Mac Enrich Service
+enrich-stop:
+	@if [ -f $(TMPDIR)/enrich.pid ]; then \
+		PID=$$(cat $(TMPDIR)/enrich.pid); \
+		kill $$PID 2>/dev/null \
+			&& echo ">>> Enrich Service (PID $$PID) stopped" \
+			|| echo ">>> Enrich Service already stopped"; \
+		rm -f $(TMPDIR)/enrich.pid; \
+	else \
+		echo ">>> No enrich service running"; \
+	fi
+
+## Health-check the running service
+health:
+	@curl -sf http://localhost:$(ENRICH_PORT)/health \
+		&& echo ">>> Mac Enrich Service healthy" \
+		|| echo ">>> WARNING: health check failed"
