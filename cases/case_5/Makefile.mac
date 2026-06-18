@@ -5,12 +5,12 @@
 #
 # PREREQUISITES:
 #   - Ollama installed:    brew install ollama
-#   - socat installed:     brew install socat
 #   - Model pulled:        ollama pull nomic-embed-text
+#   (socat is installed automatically by 'make -f Makefile.mac start')
 #
 # USAGE:
-#   make -f Makefile.mac start        — start socat bridge + Enrich Service (one shot)
-#   make -f Makefile.mac stop         — stop socat bridge + Enrich Service
+#   make -f Makefile.mac start        — install deps, start Ollama + socat bridge + Enrich Service
+#   make -f Makefile.mac stop         — stop everything
 #   make -f Makefile.mac health       — check Enrich Service + Ollama network reachability
 #
 # EXECUTION ORDER (after Windows 'make setup' completes):
@@ -25,20 +25,29 @@ OLLAMA_PORT  ?= 11434
 OLLAMA_URL   ?= http://localhost:$(OLLAMA_PORT)
 TMPDIR       ?= /tmp/pf_case5
 
-.PHONY: start stop enrich enrich-stop socat-start socat-stop health
+.PHONY: start stop deps enrich enrich-stop socat-start socat-stop health
 
 $(TMPDIR):
 	mkdir -p $(TMPDIR)
 
-## Start socat network bridge + Enrich Service in one shot
-## (Ollama must already be running: ollama serve, or via Ollama.app)
-start: stop $(TMPDIR)
-	@echo ">>> Checking Ollama is running locally..."
+## Install Mac dependencies (socat via brew)
+deps:
+	@command -v socat > /dev/null 2>&1 \
+		|| { echo ">>> Installing socat..."; brew install socat; }
+	@echo "  ✓ socat ready"
+
+## Start Ollama + socat network bridge + Enrich Service in one shot
+start: stop deps $(TMPDIR)
+	@echo ">>> Starting Ollama in background..."
+	@ollama serve > $(TMPDIR)/ollama.log 2>&1 & echo $$! > $(TMPDIR)/ollama.pid
+	@echo "  Waiting for Ollama on localhost:$(OLLAMA_PORT)..."
+	@for i in $$(seq 1 20); do \
+		curl -sf http://localhost:$(OLLAMA_PORT) > /dev/null 2>&1 && break; \
+		printf "."; sleep 2; \
+	done
 	@curl -sf http://localhost:$(OLLAMA_PORT) > /dev/null 2>&1 \
-		|| { echo "  ✗ Ollama not running on localhost:$(OLLAMA_PORT)"; \
-		     echo "    Start it first: ollama serve  (or open Ollama.app)"; \
-		     exit 1; }
-	@echo "  ✓ Ollama running on localhost:$(OLLAMA_PORT)"
+		&& echo "  ✓ Ollama running on localhost:$(OLLAMA_PORT)" \
+		|| { echo "  ✗ Ollama failed to start — check $(TMPDIR)/ollama.log"; exit 1; }
 	@$(MAKE) -f Makefile.mac socat-start
 	@$(MAKE) -f Makefile.mac enrich
 
@@ -76,8 +85,17 @@ enrich: enrich-stop $(TMPDIR)
 	@sleep 2
 	@$(MAKE) -f Makefile.mac health
 
-## Stop socat bridge + Enrich Service
+## Stop Ollama + socat bridge + Enrich Service
 stop: socat-stop enrich-stop
+	@if [ -f $(TMPDIR)/ollama.pid ]; then \
+		PID=$$(cat $(TMPDIR)/ollama.pid); \
+		kill $$PID 2>/dev/null \
+			&& echo ">>> Ollama (PID $$PID) stopped" \
+			|| echo ">>> Ollama already stopped"; \
+		rm -f $(TMPDIR)/ollama.pid; \
+	else \
+		echo ">>> Ollama not running"; \
+	fi
 
 ## Stop the Mac Enrich Service
 enrich-stop:
