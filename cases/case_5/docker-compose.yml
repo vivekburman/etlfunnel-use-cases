@@ -1,0 +1,140 @@
+version: "3.9"
+
+networks:
+  pf_net:
+    driver: bridge
+
+volumes:
+  auxdb_data:
+  postgres_src_data:
+  elasticsearch_data:
+
+services:
+
+  # AuxDB — checkpoint / backlog store (shared across all cases, port 5446)
+  auxdb:
+    image: postgres:15
+    container_name: pf_auxdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auxdb
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5446:5432"
+    volumes:
+      - auxdb_data:/var/lib/postgresql/data
+    networks:
+      - pf_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d auxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Postgres source DB — pf_catalog (Flow 32 source, port 5433)
+  postgres_src:
+    image: postgres:15
+    container_name: pf_postgres_src
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pf_catalog
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_src_data:/var/lib/postgresql/data
+    networks:
+      - pf_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d pf_catalog"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Kafka (KRaft mode, no Zookeeper) — pepperfry.catalog.raw topic
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: pf_kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_LOG_RETENTION_HOURS: "168"
+    networks:
+      - pf_net
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Elasticsearch 8.x — pf_products index with dense_vector support
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: pf_elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - pf_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -v '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+
+# Oracle XE is not included in this compose file because the Docker image
+# requires manual license acceptance. To run Flow 33 (Oracle source):
+#
+#   1. Pull the image manually:
+#      docker pull container-registry.oracle.com/database/express:21.3.0-xe
+#
+#   2. Run it:
+#      docker run -d --name pf_oracle \
+#        -p 1521:1521 \
+#        -e ORACLE_PWD=etl_pass \
+#        container-registry.oracle.com/database/express:21.3.0-xe
+#
+#   3. Create the ETL user and table (connect as SYSTEM):
+#      CREATE USER etl_user IDENTIFIED BY etl_pass;
+#      GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE TO etl_user;
+#      CREATE TABLE etl_user.PRODUCT_ATTRS (
+#        PRODUCT_ID  VARCHAR2(50) NOT NULL PRIMARY KEY,
+#        SKU_CODE    VARCHAR2(100),
+#        SUPPLIER_ID VARCHAR2(50),
+#        WEIGHT_KG   NUMBER(8,3),
+#        CATEGORY    VARCHAR2(100),
+#        COMPLIANCE  VARCHAR2(500),
+#        UPDATED_AT  TIMESTAMP DEFAULT SYSTIMESTAMP
+#      );
+#
+#   4. Set env vars before running streamcraftexecution:
+#      $env:PF_ORACLE_PASSWORD = "etl_pass"
