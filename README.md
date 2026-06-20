@@ -52,6 +52,19 @@ Zepto order lifecycle events (ORDER_CREATED → ORDER_DELIVERED) ingested from a
 
 </details>
 
+<details>
+<summary><strong>Case 5 — Pepperfry Product Catalog AI Enrichment: Postgres + Oracle → Kafka → Ollama → Elasticsearch</strong> (design)</summary>
+
+Pepperfry's product catalog is split across two systems that have never been unified — a Postgres database holding new product metadata and an Oracle ERP holding legacy SKU attributes — neither of which can serve the semantic search queries the product team needs. The pipeline unifies them into a single Elasticsearch index with 768-dim embedding vectors via four chained flows.
+
+Flow 32 polls Postgres using a time-window connector and publishes normalised product records to the shared Kafka topic `pepperfry.catalog.raw`. Flow 33 does the same for Oracle, publishing to the same topic — Kafka acts as a fan-in merge bus, absorbing the difference in ingestion rates between the two sources. Flow 34 consumes from that topic, builds an embedding-text payload per product, and POST-batches records to a Mac-local Enrich Service (a Go HTTP sidecar wrapping Ollama `nomic-embed-text`). Flow 35 cursor-polls the Enrich Service for completed embeddings and bulk-indexes each product into Elasticsearch with a `dense_vector` field for knn search.
+
+Novel concepts not in Cases 1–4: multi-source fan-in to a shared Kafka topic; the REST connector used in opposite roles — as a sink (POST batches in) and as a source (GET results via cursor); AI embedding as an inline pipeline stage; and Elasticsearch as a dense-vector destination. The four-flow chain is the longest in any case so far.
+
+**Stack:** Go, PostgreSQL, Oracle, Kafka (KRaft), Ollama (`nomic-embed-text`, 768-dim), Elasticsearch 8.x, Docker Compose · [Case study design](cases/CASE_5_DESIGN.md) · [Implementation deviations](cases/case_5_deviations.md)
+
+</details>
+
 ---
 
 ## How to use this repo
