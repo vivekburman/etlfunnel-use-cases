@@ -14,6 +14,26 @@
 # PREREQUISITES:
 #   - Docker Desktop running
 #
+# WINDOWS NOTE:
+#   FC_SNAPSHOT_DIR/FC_MOVEMENT_DIR default to /data/fc_inventory_snapshots
+#   and /data/wms_stock_movements — deliberately matching the literal
+#   defaults baked into streamcraftexecution's orchestrator_21/orchestrator_22
+#   and hardcoded in its collection.json connectionParams. Those can't be
+#   pointed anywhere else without editing that repo, so this Makefile must
+#   land files at the exact same place the execution side resolves to.
+#
+#   On native Windows (Go, PowerShell), a rooted path with no drive letter
+#   like "/data/..." resolves relative to the current drive, i.e.
+#   C:\data\.... Git Bash's MSYS layer normally intercepts that and rewrites
+#   it to "<git-install-dir>\data\..." instead (access-denied under
+#   C:\Program Files\Git\data\...) before the Go seeder ever sees it. MSYS_NO_PATHCONV=1
+#   (exported below) disables that rewrite so bash leaves the path alone and
+#   Go's native resolution takes over — landing on C:\data\..., the same
+#   place streamcraftexecution's PowerShell-run orchestrators/connectors
+#   resolve "/data/..." to. Create C:\data\fc_inventory_snapshots and
+#   C:\data\wms_stock_movements once (no admin rights needed); both sides
+#   then agree without either repo needing a path override.
+#
 # USAGE:
 #   make up             — start AuxDB + MongoDB containers and wait for healthy
 #   make deps           — download Go module dependencies
@@ -42,13 +62,16 @@ SHELL := C:/Program Files/Git/bin/bash.exe
 
 export GOTMPDIR := $(CURDIR)/tmp
 export GONOSUMCHECK := *
+export MSYS_NO_PATHCONV := 1
 
 $(shell mkdir -p $(CURDIR)/tmp)
 
 COMPOSE_FILE := docker-compose.yml
 
 AUXDB_DSN       ?= postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
-MONGO_URI       ?= mongodb://localhost:27017
+# Creds must match collection.json's hardcoded Mongo destination connectionParams.
+MONGO_URI       ?= mongodb://etl_user:etl_pass@localhost:27017/?authSource=admin
+# Must match streamcraftexecution's defaults exactly — see "WINDOWS NOTE" above.
 FC_SNAPSHOT_DIR ?= /data/fc_inventory_snapshots
 FC_MOVEMENT_DIR ?= /data/wms_stock_movements
 TOTAL_ROWS      ?= 1500

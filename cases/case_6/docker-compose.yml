@@ -34,10 +34,15 @@ services:
       start_period: 20s
 
   # MongoDB — fc_inventory database (inventory_snapshots + stock_movements)
+  # Auth creds match collection.json's hardcoded Mongo destination connectionParams
+  # (streamcraftexecution repo) — must stay in sync with those, not just Postgres.
   mongo:
     image: mongo:7
     container_name: fc_mongo
     restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: etl_user
+      MONGO_INITDB_ROOT_PASSWORD: etl_pass
     ports:
       - "27017:27017"
     volumes:
