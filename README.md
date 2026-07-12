@@ -65,6 +65,17 @@ Novel concepts not in Cases 1–4: multi-source fan-in to a shared Kafka topic; 
 
 </details>
 
+<details>
+<summary><strong>Case 6 — Fulfillment Center Inventory Ops: Parquet + Avro File Landing Zones → MongoDB</strong> (design)</summary>
+
+Modelled after **Delhivery**, a logistics operator whose two inventory sources have never exposed a live API, database, or stream. A Spark data platform drops a nightly inventory snapshot as Spark/Hive-style numbered Parquet part files into a fresh dated directory each day; a legacy on-prem Warehouse Management System exports stock movement events as Avro (OCF) part files, appended continuously into a single flat directory that never rotates. Two independent flows full-scan their respective directories and upsert into MongoDB — `inventory_snapshots` and `stock_movements` — with no shared bus and no start-order dependency between them.
+
+The defining mechanic is the framework's file I/O model: the connector never scans a directory itself — the client's `GenerateScan` lists the files and hands back an explicit `Files []string`, and `StartAfterPart` resumes as a 0-based index into that client-supplied list rather than a cursor or Kafka offset. Because each source connector is bound to one fixed `Directory`, the pipeline treats a rotating daily directory (Parquet) and a non-rotating flat directory (Avro) as two different checkpoint shapes — one reaches a clean `PARTS_EXHAUSTED` stop, the other only ever idles out. Every fault in this case is a structurally valid, well-typed row that is semantically wrong (negative quantity, unknown movement-type enum), since Parquet and Avro both enforce their own schema at the file level — there's no parse-error class of failure here.
+
+**Stack:** Go, Parquet (`parquet-go`), Avro/OCF (`hamba/avro`), MongoDB 7, PostgreSQL (AuxDB), Docker Compose · [Case study](cases/case_6/case_6_etl_casestudy_plan.md)
+
+</details>
+
 ---
 
 ## How to use this repo

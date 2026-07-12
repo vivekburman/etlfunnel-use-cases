@@ -1,0 +1,57 @@
+version: "3.9"
+
+networks:
+  fc_net:
+    driver: bridge
+
+volumes:
+  auxdb_data:
+  mongo_data:
+
+services:
+
+  # AuxDB — checkpoint / backlog store (shared across all cases, port 5446)
+  auxdb:
+    image: postgres:15
+    container_name: fc_auxdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auxdb
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5446:5432"
+    volumes:
+      - auxdb_data:/var/lib/postgresql/data
+    networks:
+      - fc_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d auxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # MongoDB — fc_inventory database (inventory_snapshots + stock_movements)
+  # Auth creds match collection.json's hardcoded Mongo destination connectionParams
+  # (streamcraftexecution repo) — must stay in sync with those, not just Postgres.
+  mongo:
+    image: mongo:7
+    container_name: fc_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: etl_user
+      MONGO_INITDB_ROOT_PASSWORD: etl_pass
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - fc_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
