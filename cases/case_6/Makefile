@@ -1,0 +1,158 @@
+# ============================================================
+# FC Inventory Ops Pipeline — Case 6
+# Windows Setup Makefile (infrastructure only)
+# ============================================================
+#
+# ARCHITECTURE:
+#   Flow 36: Parquet snapshot directory (dt=<date>, rotates daily) → MongoDB inventory_snapshots
+#   Flow 37: Avro movement directory (flat, never rotates)         → MongoDB stock_movements
+#
+# Neither source has a live API/DB/stream to poll — both are directories of
+# Spark/Hive-style numbered part files landing on disk. The seeders here
+# write real Parquet/Avro files, not HTTP mock responses.
+#
+# PREREQUISITES:
+#   - Docker Desktop running
+#
+# USAGE:
+#   make up             — start AuxDB + MongoDB containers and wait for healthy
+#   make deps           — download Go module dependencies
+#   make auxdb          — create AuxDB checkpoint/backlog tables (run once after 'up')
+#   make mongo-init     — create MongoDB unique indexes (run once after 'up')
+#   make seed-snapshot  — write today's Parquet snapshot directory
+#   make seed-movement  — append a new batch of Avro movement part files
+#   make seed-backlog   — insert synthetic backlog rows into AuxDB (N=20 per table by default)
+#   make setup          — full bootstrap: up → auxdb → mongo-init
+#   make watch          — live metrics dashboard (polls AuxDB + MongoDB, Ctrl+C to exit)
+#   make logs           — tail all container logs
+#   make status         — show container health
+#   make down           — stop containers (keep volumes)
+#   make reset          — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make lint           — run golangci-lint
+#
+# EXECUTION ORDER:
+#   make setup
+#   make seed-snapshot
+#   make seed-movement
+#   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement) — no ordering constraint
+#   make watch
+
+SHELL := C:/Program Files/Git/bin/bash.exe
+.SHELLFLAGS := -euo pipefail -c
+
+export GOTMPDIR := $(CURDIR)/tmp
+export GONOSUMCHECK := *
+
+$(shell mkdir -p $(CURDIR)/tmp)
+
+COMPOSE_FILE := docker-compose.yml
+
+AUXDB_DSN       ?= postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
+MONGO_URI       ?= mongodb://localhost:27017
+FC_SNAPSHOT_DIR ?= /data/fc_inventory_snapshots
+FC_MOVEMENT_DIR ?= /data/wms_stock_movements
+TOTAL_ROWS      ?= 1500
+ROWS_PER_PART   ?= 1000
+NEW_MOVEMENTS   ?= 2000
+MOVEMENT_ROWS_PER_PART ?= 500
+FAULT_RATE      ?= 5
+INTERVAL        ?= 5s
+N               ?= 20
+
+.PHONY: up down reset wait-healthy deps auxdb mongo-init seed-snapshot seed-movement seed-backlog setup watch logs status lint
+
+## Start all containers
+up:
+	@echo ">>> Starting Docker containers..."
+	docker compose -f $(COMPOSE_FILE) up -d
+	@echo ">>> Waiting for all services to be healthy..."
+	$(MAKE) wait-healthy
+
+## Wait until all containers report healthy
+wait-healthy:
+	@echo "  Checking health..."
+	@for svc in fc_auxdb fc_mongo; do \
+		printf "  Waiting for $$svc "; \
+		for i in $$(seq 1 60); do \
+			STATUS=$$(docker inspect --format='{{.State.Health.Status}}' $$svc 2>/dev/null || echo "missing"); \
+			if [ "$$STATUS" = "healthy" ]; then printf " ok\n"; break; fi; \
+			printf "."; sleep 3; \
+		done; \
+	done
+	@echo ">>> All containers healthy"
+
+## Stop containers, keep volumes
+down:
+	docker compose -f $(COMPOSE_FILE) down
+
+## Stop containers and destroy volumes (DESTRUCTIVE)
+reset:
+	docker compose -f $(COMPOSE_FILE) down -v
+	@echo ">>> Volumes destroyed"
+
+## Download Go module dependencies
+deps:
+	@echo ">>> Downloading Go dependencies..."
+	go mod download
+	go mod tidy
+	@echo ">>> Dependencies ready"
+
+## Create AuxDB tables (run once after 'up')
+auxdb:
+	@echo ">>> Setting up AuxDB tables..."
+	go build -o $(GOTMPDIR)/auxdb_init$(GOEXE) ./cmd/auxdb_setup
+	$(GOTMPDIR)/auxdb_init$(GOEXE) -dsn "$(AUXDB_DSN)"
+	@echo ">>> AuxDB ready"
+
+## Create MongoDB unique indexes (run once after 'up')
+mongo-init:
+	@echo ">>> Creating MongoDB indexes..."
+	MONGO_URI="$(MONGO_URI)" go run ./cmd/mongo_init
+	@echo ">>> MongoDB ready"
+
+## Write today's Parquet snapshot directory (or SNAPSHOT_DATE=YYYY-MM-DD)
+seed-snapshot:
+	@echo ">>> Seeding Parquet snapshot directory..."
+	FC_SNAPSHOT_DIR="$(FC_SNAPSHOT_DIR)" go run ./cmd/snapshot_seeder \
+		-total $(TOTAL_ROWS) -rows-per-part $(ROWS_PER_PART) -fault-rate $(FAULT_RATE) $(if $(SNAPSHOT_DATE),-date $(SNAPSHOT_DATE),)
+	@echo ">>> Snapshot seed complete"
+
+## Append a new batch of Avro movement part files
+seed-movement:
+	@echo ">>> Seeding Avro movement directory..."
+	FC_MOVEMENT_DIR="$(FC_MOVEMENT_DIR)" go run ./cmd/movement_seeder \
+		-new $(NEW_MOVEMENTS) -rows-per-part $(MOVEMENT_ROWS_PER_PART) -fault-rate $(FAULT_RATE)
+	@echo ">>> Movement seed complete"
+
+## Insert synthetic backlog rows into AuxDB (N=20 per table by default)
+seed-backlog:
+	@echo ">>> Seeding synthetic backlog rows (N=$(N))..."
+	AUXDB_DSN="$(AUXDB_DSN)" go run ./cmd/backlog_seeder -n $(N)
+	@echo ">>> Backlog seed complete"
+
+## Full bootstrap: start containers → create AuxDB tables → create MongoDB indexes
+setup: up auxdb mongo-init
+	@echo ""
+	@echo ">>> Setup complete. Next steps:"
+	@echo "   make seed-snapshot   — write today's Parquet snapshot directory"
+	@echo "   make seed-movement   — append a batch of Avro movement part files"
+	@echo "   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement)"
+	@echo "   make watch           — live metrics dashboard"
+
+## Live metrics dashboard (polls AuxDB + MongoDB, Ctrl+C to exit)
+watch:
+	AUXDB_DSN="$(AUXDB_DSN)" MONGO_URI="$(MONGO_URI)" go run ./cmd/metrics_watcher -interval $(INTERVAL)
+
+## Tail container logs
+logs:
+	docker compose -f $(COMPOSE_FILE) logs -f
+
+## Show container health
+status:
+	@docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
+		--filter name=fc_auxdb \
+		--filter name=fc_mongo
+
+## Run golangci-lint
+lint:
+	golangci-lint run ./...
