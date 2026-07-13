@@ -493,9 +493,6 @@ make migrate      # Apply SQL Server schema (create dbo/stage tables and indexes
 make backfill     # Run Historical Backfill Flow (all 3 properties, 730 days)
 make daily        # Run Incremental Daily Flow (T-2 for all 3 properties)
 make realtime     # Run Realtime Pulse Flow (single snapshot, for testing)
-make verify       # Run SQL queries to assert row counts and no duplicates
-make clean        # Drop stage.* tables and truncate dbo.* tables
-make test         # Run Go unit tests for connector + transformer chain
 ```
 
 ---
@@ -577,17 +574,16 @@ The following are intentional scope boundaries for this case study — deferred 
 
 ### Phase 8 — Observability
 
-- [ ] **STEP-37** — Implement `cmd/metrics_watcher/main.go` — polls SQL Server every N seconds and prints a live terminal dashboard. Sections: (1) recent pipeline runs — name, property, status, rows fetched/merged, quota tokens spent; (2) backfill progress — completed dates per property vs total date range; (3) `dbo.ga4_sessions` row count by `(property_id, surface)`; (4) realtime sessions — current row count and oldest/newest `snapshot_at`; (5) backlog summary — count by `error_code`. Configurable via `--sqlserver` and `--interval` flags.
-- [ ] **STEP-38** — Add structured logging at key lifecycle events: pagination page fetched (property, date, offset, rows returned, quota tokens spent), MERGE completed (rows inserted, rows updated), `QuotaThrottle` sleep triggered (property, tokens spent, sleep duration), backlog record written (property, error code), realtime snapshot written (property, rows inserted, rows TTL-deleted), TerminateRule fired (rule name, threshold, observed value), checkpoint saved (property, date).
+- [ ] **STEP-37** — Add structured logging at key lifecycle events: pagination page fetched (property, date, offset, rows returned, quota tokens spent), MERGE completed (rows inserted, rows updated), `QuotaThrottle` sleep triggered (property, tokens spent, sleep duration), backlog record written (property, error code), realtime snapshot written (property, rows inserted, rows TTL-deleted), TerminateRule fired (rule name, threshold, observed value), checkpoint saved (property, date).
 
 ### Phase 9 — End-to-End Test Run
 
-- [ ] **STEP-39** — Run `make up` to start SQL Server and the seeder. Run `make migrate` to apply the schema. Verify all five tables exist in `analytics_warehouse` (`dbo.ga4_sessions`, `stage.ga4_sessions`, `dbo.realtime_sessions`, `dbo.pipeline_run_log`, `dbo.pipeline_backlog`) with correct column definitions and indexes.
-- [ ] **STEP-40** — Run seeder smoke test: send a manual `POST /v1beta/properties/123456789:runReport` with a 1-day window and `offset=0`. Verify the response contains `dimensionHeaders`, `metricHeaders`, `rows`, and a valid `rowCount`. Verify pagination by fetching with `offset=100000` for a high-volume day (> 100K rows) and confirming a partial second page is returned.
-- [ ] **STEP-41** — Run quota exhaustion test: send 401 consecutive `runReport` requests for the same property in the same simulated hour window. Verify HTTP 429 is returned after 40,000 simulated tokens and that the connector's backoff logic fires correctly.
-- [ ] **STEP-42** — Run backfill smoke test: single property (`myntra-web`), 3-day window only. Verify `dbo.pipeline_run_log` shows 3 completed rows, `dbo.ga4_sessions` contains rows for all 3 dates with correct `property_id` and `surface` values, and `stage.ga4_sessions` is empty (truncated post-MERGE).
-- [ ] **STEP-43** — Verify intentional bad records from seeder: confirm `dbo.pipeline_backlog` contains rows with `error_code = 'INVALID_DATE'` and `error_code = 'METRIC_PARSE_FAILURE'` at approximately the injected rates from STEP-10.
-- [ ] **STEP-44** — Test checkpoint/resume: run the backfill for `myntra-web` for 7 days. Kill the process after 4 dates complete. Restart. Verify the run skips the 4 already-completed dates and processes only the remaining 3 without duplicating rows in `dbo.ga4_sessions`.
-- [ ] **STEP-45** — Test MERGE idempotency: run the daily flow for `T-2` twice in succession. Verify that the row count in `dbo.ga4_sessions` does not increase on the second run (rows are updated via MERGE, not duplicated).
-- [ ] **STEP-46** — Run realtime smoke test: invoke `make realtime` 3 times in quick succession. Verify `dbo.realtime_sessions` accumulates rows across runs and that the TTL DELETE correctly removes rows older than 2 hours.
-- [ ] **STEP-47** — Run full backfill: all 3 properties, 730 days. Monitor via `make watch`. Verify final row counts in `dbo.ga4_sessions` per property against seeder-generated totals (allowing for intentional backlog records). Confirm counts match within ±1%.
+- [ ] **STEP-38** — Run `make up` to start SQL Server and the seeder. Run `make migrate` to apply the schema. Verify all five tables exist in `analytics_warehouse` (`dbo.ga4_sessions`, `stage.ga4_sessions`, `dbo.realtime_sessions`, `dbo.pipeline_run_log`, `dbo.pipeline_backlog`) with correct column definitions and indexes.
+- [ ] **STEP-39** — Run seeder smoke test: send a manual `POST /v1beta/properties/123456789:runReport` with a 1-day window and `offset=0`. Verify the response contains `dimensionHeaders`, `metricHeaders`, `rows`, and a valid `rowCount`. Verify pagination by fetching with `offset=100000` for a high-volume day (> 100K rows) and confirming a partial second page is returned.
+- [ ] **STEP-40** — Run quota exhaustion test: send 401 consecutive `runReport` requests for the same property in the same simulated hour window. Verify HTTP 429 is returned after 40,000 simulated tokens and that the connector's backoff logic fires correctly.
+- [ ] **STEP-41** — Run backfill smoke test: single property (`myntra-web`), 3-day window only. Verify `dbo.pipeline_run_log` shows 3 completed rows, `dbo.ga4_sessions` contains rows for all 3 dates with correct `property_id` and `surface` values, and `stage.ga4_sessions` is empty (truncated post-MERGE).
+- [ ] **STEP-42** — Verify intentional bad records from seeder: confirm `dbo.pipeline_backlog` contains rows with `error_code = 'INVALID_DATE'` and `error_code = 'METRIC_PARSE_FAILURE'` at approximately the injected rates from STEP-10.
+- [ ] **STEP-43** — Test checkpoint/resume: run the backfill for `myntra-web` for 7 days. Kill the process after 4 dates complete. Restart. Verify the run skips the 4 already-completed dates and processes only the remaining 3 without duplicating rows in `dbo.ga4_sessions`.
+- [ ] **STEP-44** — Test MERGE idempotency: run the daily flow for `T-2` twice in succession. Verify that the row count in `dbo.ga4_sessions` does not increase on the second run (rows are updated via MERGE, not duplicated).
+- [ ] **STEP-45** — Run realtime smoke test: invoke `make realtime` 3 times in quick succession. Verify `dbo.realtime_sessions` accumulates rows across runs and that the TTL DELETE correctly removes rows older than 2 hours.
+- [ ] **STEP-46** — Run full backfill: all 3 properties, 730 days. Verify final row counts in `dbo.ga4_sessions` per property against seeder-generated totals (allowing for intentional backlog records). Confirm counts match within ±1%.
