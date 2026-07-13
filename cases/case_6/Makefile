@@ -36,26 +36,18 @@
 #
 # USAGE:
 #   make up             — start AuxDB + MongoDB containers and wait for healthy
-#   make deps           — download Go module dependencies
-#   make auxdb          — create AuxDB checkpoint/backlog tables (run once after 'up')
-#   make mongo-init     — create MongoDB unique indexes (run once after 'up')
+#   make setup          — full bootstrap: up → AuxDB tables → MongoDB indexes
 #   make seed-snapshot  — write today's Parquet snapshot directory
 #   make seed-movement  — append a new batch of Avro movement part files
 #   make seed-backlog   — insert synthetic backlog rows into AuxDB (N=20 per table by default)
-#   make setup          — full bootstrap: up → auxdb → mongo-init
-#   make watch          — live metrics dashboard (polls AuxDB + MongoDB, Ctrl+C to exit)
-#   make logs           — tail all container logs
-#   make status         — show container health
 #   make down           — stop containers (keep volumes)
 #   make reset          — stop containers AND destroy volumes (DESTRUCTIVE)
-#   make lint           — run golangci-lint
 #
 # EXECUTION ORDER:
 #   make setup
 #   make seed-snapshot
 #   make seed-movement
 #   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement) — no ordering constraint
-#   make watch
 
 SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -euo pipefail -c
@@ -79,21 +71,15 @@ ROWS_PER_PART   ?= 1000
 NEW_MOVEMENTS   ?= 2000
 MOVEMENT_ROWS_PER_PART ?= 500
 FAULT_RATE      ?= 5
-INTERVAL        ?= 5s
 N               ?= 20
 
-.PHONY: up down reset wait-healthy deps auxdb mongo-init seed-snapshot seed-movement seed-backlog setup watch logs status lint
+.PHONY: up down reset setup seed-snapshot seed-movement seed-backlog
 
 ## Start all containers
 up:
 	@echo ">>> Starting Docker containers..."
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ">>> Waiting for all services to be healthy..."
-	$(MAKE) wait-healthy
-
-## Wait until all containers report healthy
-wait-healthy:
-	@echo "  Checking health..."
 	@for svc in fc_auxdb fc_mongo; do \
 		printf "  Waiting for $$svc "; \
 		for i in $$(seq 1 60); do \
@@ -113,25 +99,21 @@ reset:
 	docker compose -f $(COMPOSE_FILE) down -v
 	@echo ">>> Volumes destroyed"
 
-## Download Go module dependencies
-deps:
+## Full bootstrap: start containers → AuxDB tables → MongoDB indexes
+setup: up
 	@echo ">>> Downloading Go dependencies..."
 	go mod download
 	go mod tidy
-	@echo ">>> Dependencies ready"
-
-## Create AuxDB tables (run once after 'up')
-auxdb:
 	@echo ">>> Setting up AuxDB tables..."
 	go build -o $(GOTMPDIR)/auxdb_init$(GOEXE) ./cmd/auxdb_setup
 	$(GOTMPDIR)/auxdb_init$(GOEXE) -dsn "$(AUXDB_DSN)"
-	@echo ">>> AuxDB ready"
-
-## Create MongoDB unique indexes (run once after 'up')
-mongo-init:
 	@echo ">>> Creating MongoDB indexes..."
 	MONGO_URI="$(MONGO_URI)" go run ./cmd/mongo_init
-	@echo ">>> MongoDB ready"
+	@echo ""
+	@echo ">>> Setup complete. Next steps:"
+	@echo "   make seed-snapshot   - write today's Parquet snapshot directory"
+	@echo "   make seed-movement   - append a batch of Avro movement part files"
+	@echo "   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement)"
 
 ## Write today's Parquet snapshot directory (or SNAPSHOT_DATE=YYYY-MM-DD)
 seed-snapshot:
@@ -152,30 +134,3 @@ seed-backlog:
 	@echo ">>> Seeding synthetic backlog rows (N=$(N))..."
 	AUXDB_DSN="$(AUXDB_DSN)" go run ./cmd/backlog_seeder -n $(N)
 	@echo ">>> Backlog seed complete"
-
-## Full bootstrap: start containers → create AuxDB tables → create MongoDB indexes
-setup: up auxdb mongo-init
-	@echo ""
-	@echo ">>> Setup complete. Next steps:"
-	@echo "   make seed-snapshot   — write today's Parquet snapshot directory"
-	@echo "   make seed-movement   — append a batch of Avro movement part files"
-	@echo "   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement)"
-	@echo "   make watch           — live metrics dashboard"
-
-## Live metrics dashboard (polls AuxDB + MongoDB, Ctrl+C to exit)
-watch:
-	AUXDB_DSN="$(AUXDB_DSN)" MONGO_URI="$(MONGO_URI)" go run ./cmd/metrics_watcher -interval $(INTERVAL)
-
-## Tail container logs
-logs:
-	docker compose -f $(COMPOSE_FILE) logs -f
-
-## Show container health
-status:
-	@docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
-		--filter name=fc_auxdb \
-		--filter name=fc_mongo
-
-## Run golangci-lint
-lint:
-	golangci-lint run ./...

@@ -539,7 +539,7 @@ This means cursor positions are stable across seeder restarts — `seq_500` alwa
 
 ### 8.5 Backlog Seeder
 
-`cmd/backlog_seeder` is a standalone tool that directly inserts synthetic failure records into both AuxDB backlog tables, bypassing the pipeline entirely. This allows the `make watch` metrics dashboard to show non-zero backlog counts immediately after `make setup`, without needing to run a full pipeline execution with fault injection.
+`cmd/backlog_seeder` is a standalone tool that directly inserts synthetic failure records into both AuxDB backlog tables, bypassing the pipeline entirely. This lets you populate both backlog tables with representative failure data immediately after `make setup`, without needing to run a full pipeline execution with fault injection.
 
 ```
 make seed-backlog          # inserts 20 rows into each backlog table
@@ -558,78 +558,16 @@ Storage backlog entries simulate:
 
 ---
 
-## Part 9 — Metrics Dashboard
-
-`cmd/metrics_watcher` is a live terminal dashboard that polls AuxDB every few seconds and displays the state of both flows.
-
-### 9.1 Dashboard Sections
-
-| Section | AuxDB Table | What It Shows |
-|---|---|---|
-| **Flow 1 cursor checkpoints** | `zepto_ingestion_cursors` | `pipeline`, `last_cursor`, `updated_at` — confirms Flow 1 is advancing |
-| **Flow 2 offset checkpoints** | `zepto_storage_offsets` | `topic`, `partition`, `last_offset`, `updated_at` per partition — confirms Flow 2 is consuming |
-| **Backlog counts** | `zepto_ingestion_backlog`, `zepto_storage_backlog` | Row counts; recent ingestion backlog entries with stage and error |
-
-### 9.2 Running It
-
-```bash
-go run ./cmd/metrics_watcher             # defaults: 5s interval, local AuxDB
-make watch                               # same
-make watch INTERVAL=10s                  # 10-second poll
-```
-
-### 9.3 Sample Output
-
-```
-=== Zepto Order Events Pipeline — Live Metrics [14:32:08] ===
-
-── Flow 1: REST API → Kafka (cursor checkpoints) ────────────────────────────────
-  pipeline=order_events_ingestion   cursor=seq_1500             updated=2026-06-17 14:32:05
-
-── Flow 2: Kafka → Cassandra (offset checkpoints) ───────────────────────────────
-  topic                           partition   last_offset  updated_at
-  zepto.order.events                      0          4,821  2026-06-17 14:32:06
-  zepto.order.events                      1          4,803  2026-06-17 14:32:06
-  zepto.order.events                      2          4,810  2026-06-17 14:32:06
-
-── Backlogs ──────────────────────────────────────────────────────────────────────
-  zepto_ingestion_backlog (Flow 1 failed publishes) : 3
-  zepto_storage_backlog   (Flow 2 failed writes)    : 7
-
-  Recent ingestion backlog entries:
-    ORD-00000020  event-id-...  transform  2026-06-17 14:31:50  transformer_81: ...
-
-(refreshes every few seconds — Ctrl+C to exit)
-```
-
-### 9.4 Signals to Watch
-
-| Signal | Threshold | Likely Cause |
-|---|---|---|
-| Cursor not advancing | 3+ consecutive ticks | Flow 1 stalled — API unreachable or Kafka publish failing |
-| Offset not advancing | Any partition idle 3+ ticks | Flow 2 stalled — Cassandra unreachable or consumer paused |
-| Ingestion backlog growing | Rate > 5% of published events | Fault rate high; or `transformer_81` config issue |
-| Storage backlog growing | Rate > 5% of consumed events | Bad timestamps in source data; or Cassandra schema mismatch |
-
----
-
-## Part 10 — Makefile Targets
+## Part 9 — Makefile Targets
 
 ```makefile
 make up           # Start AuxDB + Kafka + Cassandra containers and wait for healthy
-make deps         # Download Go module dependencies
-make auxdb        # Create AuxDB tables (run once after 'up')
-make cassandra    # Create Cassandra keyspace + order_events table (run once after 'up')
 make seed         # Start Zepto REST API mock server on :11334 (background)
 make seed-stop    # Stop the mock seeder
 make seed-backlog # Insert synthetic backlog rows into AuxDB (N=20 per table by default)
 make setup        # Full bootstrap: up → auxdb → cassandra
-make watch        # Live metrics dashboard (polls AuxDB, Ctrl+C to exit)
-make logs         # Tail all container logs
-make status       # Show container health
 make down         # Stop containers (keep volumes)
 make reset        # Stop containers AND destroy volumes (DESTRUCTIVE)
-make lint         # Run golangci-lint
 ```
 
 **Seed overrides:**
@@ -648,7 +586,7 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 
 ---
 
-## Part 11 — Step-by-Step Implementation Tasks
+## Part 10 — Step-by-Step Implementation Tasks
 
 ### Phase 1 — Infrastructure Setup
 
@@ -718,24 +656,23 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 
 ### Phase 8 — Observability
 
-- [ ] **STEP-30** — Implement `cmd/metrics_watcher/main.go` — polls AuxDB on a configurable `--interval` (default 5s). Three sections: (1) Flow 1 cursor checkpoints from `zepto_ingestion_cursors`, (2) Flow 2 offset checkpoints from `zepto_storage_offsets`, (3) backlog counts from both tables with recent entries for `zepto_ingestion_backlog` (most recent 5 rows with order_id, event_id, stage, error). Uses `pgx/v5` for AuxDB queries. Clears screen each tick with ANSI escape `\033[H\033[2J`. Exits cleanly on `SIGINT` / `SIGTERM`.
-- [ ] **STEP-31** — Add structured logging at key events: page fetched (cursor, count, has_more), Kafka publish batch committed (count, topic, partition), Kafka offset committed (partition, offset), Cassandra batch written (count, latency), backlog record inserted (stage, error), TerminateRule fired (rule name, flow), cursor checkpoint saved (pipeline, cursor), offset checkpoint saved (partition, offset).
+- [ ] **STEP-30** — Add structured logging at key events: page fetched (cursor, count, has_more), Kafka publish batch committed (count, topic, partition), Kafka offset committed (partition, offset), Cassandra batch written (count, latency), backlog record inserted (stage, error), TerminateRule fired (rule name, flow), cursor checkpoint saved (pipeline, cursor), offset checkpoint saved (partition, offset).
 
 ### Phase 9 — End-to-End Test Run
 
-- [ ] **STEP-32** — Run `make setup` (Docker up → wait healthy → `make auxdb` → `make cassandra`). Verify all 4 AuxDB tables exist via `psql`. Verify Cassandra keyspace and table exist via `cqlsh -e "DESCRIBE zepto_events.order_events"`.
-- [ ] **STEP-33** — Run `make seed` with defaults (`TOTAL_EVENTS=2000 FAULT_RATE=5`). Verify seeder is reachable: `curl -H "X-Internal-Token: dev-token" "http://localhost:11334/api/v2/order-events?limit=10"`. Confirm response shape: `events` array, `next_cursor`, `has_more=true`.
-- [ ] **STEP-34** — Run `make seed-backlog`. Verify both AuxDB backlog tables contain 20 rows each. Run `make watch` to confirm the metrics dashboard shows non-zero backlog counts.
-- [ ] **STEP-35** — Start Flow 2 (pid=29) first. Verify it creates the Kafka consumer group and begins waiting for messages. Then start Flow 1 (pid=28). Verify Flow 1 begins publishing events and `zepto_ingestion_cursors` shows a non-empty `last_cursor` within the first poll interval.
-- [ ] **STEP-36** — After 1–2 minutes of execution, query Cassandra: `SELECT COUNT(*) FROM zepto_events.order_events;`. Confirm rows are accumulating. Query `zepto_storage_offsets` and confirm `last_offset` is advancing on all 3 partitions.
-- [ ] **STEP-37** — Verify fault handling: with `FAULT_RATE=5` and `TOTAL_EVENTS=2000`, expect ~33 fault records (5% of 2000, split across 3 fault types). Confirm:
+- [ ] **STEP-31** — Run `make setup` (Docker up → wait healthy → `make auxdb` → `make cassandra`). Verify all 4 AuxDB tables exist via `psql`. Verify Cassandra keyspace and table exist via `cqlsh -e "DESCRIBE zepto_events.order_events"`.
+- [ ] **STEP-32** — Run `make seed` with defaults (`TOTAL_EVENTS=2000 FAULT_RATE=5`). Verify seeder is reachable: `curl -H "X-Internal-Token: dev-token" "http://localhost:11334/api/v2/order-events?limit=10"`. Confirm response shape: `events` array, `next_cursor`, `has_more=true`.
+- [ ] **STEP-33** — Run `make seed-backlog`. Verify both AuxDB backlog tables contain 20 rows each via a direct `psql` count query against `zepto_ingestion_backlog` and `zepto_storage_backlog`.
+- [ ] **STEP-34** — Start Flow 2 (pid=29) first. Verify it creates the Kafka consumer group and begins waiting for messages. Then start Flow 1 (pid=28). Verify Flow 1 begins publishing events and `zepto_ingestion_cursors` shows a non-empty `last_cursor` within the first poll interval.
+- [ ] **STEP-35** — After 1–2 minutes of execution, query Cassandra: `SELECT COUNT(*) FROM zepto_events.order_events;`. Confirm rows are accumulating. Query `zepto_storage_offsets` and confirm `last_offset` is advancing on all 3 partitions.
+- [ ] **STEP-36** — Verify fault handling: with `FAULT_RATE=5` and `TOTAL_EVENTS=2000`, expect ~33 fault records (5% of 2000, split across 3 fault types). Confirm:
   - ~11 Fault Type A records: silent drops — no backlog rows, but records-dropped counter incremented in pipeline metrics
   - ~11 Fault Type B records: appear in `zepto_storage_backlog` with `failure_stage=transform` and `transformer_88` error
   - ~11 Fault Type C records: appear in `zepto_ingestion_backlog` with `failure_stage=transform` and `transformer_81` error
-- [ ] **STEP-38** — Test checkpoint/resume for Flow 1: kill Flow 1 mid-run. Note the `last_cursor` value in `zepto_ingestion_cursors`. Restart Flow 1. Confirm it resumes from that cursor and does not re-publish already-committed pages.
-- [ ] **STEP-39** — Test checkpoint/resume for Flow 2: kill Flow 2 mid-run. Note the `last_offset` values in `zepto_storage_offsets`. Restart Flow 2. Confirm it resumes from `last_offset + 1` per partition and does not re-write already-committed records to Cassandra (idempotent upsert by primary key: `(city, store_id, event_type, created_at, event_id)`).
-- [ ] **STEP-40** — Test TTL enforcement: insert a synthetic Cassandra row directly via `cqlsh` with `USING TTL 10` (10 seconds). Wait 12 seconds. Confirm the row is no longer returned by `SELECT`. This validates TWCS compaction and TTL are working correctly in the local cluster.
-- [ ] **STEP-41** — Full pipeline run: `make reset` → `make setup` → `make seed TOTAL_EVENTS=2000 FAULT_RATE=5` → start Flow 2 → start Flow 1 → monitor via `make watch` until Flow 1 terminates (cursor exhausted). Verify final Cassandra row count is approximately `2000 - 11` (total events minus silent-drop Fault Type A records). Verify `zepto_ingestion_backlog` has ~11 rows and `zepto_storage_backlog` has ~11 rows.
+- [ ] **STEP-37** — Test checkpoint/resume for Flow 1: kill Flow 1 mid-run. Note the `last_cursor` value in `zepto_ingestion_cursors`. Restart Flow 1. Confirm it resumes from that cursor and does not re-publish already-committed pages.
+- [ ] **STEP-38** — Test checkpoint/resume for Flow 2: kill Flow 2 mid-run. Note the `last_offset` values in `zepto_storage_offsets`. Restart Flow 2. Confirm it resumes from `last_offset + 1` per partition and does not re-write already-committed records to Cassandra (idempotent upsert by primary key: `(city, store_id, event_type, created_at, event_id)`).
+- [ ] **STEP-39** — Test TTL enforcement: insert a synthetic Cassandra row directly via `cqlsh` with `USING TTL 10` (10 seconds). Wait 12 seconds. Confirm the row is no longer returned by `SELECT`. This validates TWCS compaction and TTL are working correctly in the local cluster.
+- [ ] **STEP-40** — Full pipeline run: `make reset` → `make setup` → `make seed TOTAL_EVENTS=2000 FAULT_RATE=5` → start Flow 2 → start Flow 1 → wait until Flow 1 terminates (cursor exhausted). Verify final Cassandra row count is approximately `2000 - 11` (total events minus silent-drop Fault Type A records). Verify `zepto_ingestion_backlog` has ~11 rows and `zepto_storage_backlog` has ~11 rows.
 
 ---
 
@@ -758,5 +695,5 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 | AuxDB tables | 4: `zepto_ingestion_cursors`, `zepto_ingestion_backlog`, `zepto_storage_offsets`, `zepto_storage_backlog` |
 | Control plane | Per-flow checkpointing (cursor for Flow 1, per-partition offsets for Flow 2) + separate backlogs per flow |
 | Seeder | Go HTTP mock server on `:11334`, deterministic event pool, cursor-stable responses |
-| Implementation steps | 41 steps across 9 phases |
+| Implementation steps | 40 steps across 9 phases |
 | New patterns vs Case 3 | Cursor API (not offset), Kafka as durable buffer, Cassandra time-series destination, two-backlog architecture, TWCS + per-row TTL |

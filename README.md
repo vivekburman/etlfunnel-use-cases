@@ -87,7 +87,7 @@ Each case lives in `cases/case_N/` and is self-contained. Inside you will find:
 - The full ETLFunnel client code generated for that scenario
 - A case study plan document explaining the architecture and design decisions
 
-Start with the case study plan to understand the problem, then follow the `make setup` → `make watch` flow to see it run end to end.
+Start with the case study plan to understand the problem, then follow the `make setup` → `make seed` flow to see it run end to end.
 
 ---
 

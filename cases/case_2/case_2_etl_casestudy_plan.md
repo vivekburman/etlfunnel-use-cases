@@ -593,121 +593,24 @@ Stage 1 and Stage 2 run in separate processes. If Elasticsearch slows and `Desti
 
 ### Phase 8 — Observability
 
-- [ ] **STEP-36** — Implement `cmd/metrics_watcher/main.go` — polls AuxDB and Elasticsearch every N seconds. Displays live dashboard with 8 sections (see §6.2). Uses `pgx/v5` for AuxDB queries and Elasticsearch `_cat/count` + `_stats` APIs for destination metrics. Adapts Case 1's metrics_watcher pattern for dual-flow architecture.
-- [ ] **STEP-37** — Add structured logging at key lifecycle events: WAL slot connected/disconnected, Redis producer published N events, consumer group lag delta, checkpoint written, backlog routed, TerminateRule fired, backfill phase complete, Elasticsearch refresh triggered.
+- [ ] **STEP-36** — Add structured logging at key lifecycle events: WAL slot connected/disconnected, Redis producer published N events, consumer group lag delta, checkpoint written, backlog routed, TerminateRule fired, backfill phase complete, Elasticsearch refresh triggered.
 
 ### Phase 9 — End-to-End Test Run
 
-- [ ] **STEP-38** — Run `make setup` (full bootstrap: Docker up → pg_schema → es_schema → auxdb_setup → wal_enabler → seed).
-- [ ] **STEP-39** — Run cold flow smoke test: single brand (zomato_food), single city (delhi), single entity (orders) only. Verify checkpoint written, records indexed in Elasticsearch, backlog count is within expected threshold.
-- [ ] **STEP-40** — Verify intentional bad records from seeder: null customer_id, unmapped city_id, impossible timestamps — all should appear in AuxDB `backlog_records` with correct `error_code`.
-- [ ] **STEP-41** — Run hot flow smoke test: run `wal_enabler` again to confirm slot is active, then insert 100 test orders directly into `zomato_food_db`, verify they appear in Elasticsearch within 5 seconds.
-- [ ] **STEP-42** — Test overlap: insert 10 orders into `zomato_food_db` that have `order_id` values already indexed by the cold flow. Verify Elasticsearch document count does NOT increase (upsert, not insert) and `indexed_at` is updated.
-- [ ] **STEP-43** — Test TerminateRule: artificially set `force_stop = true` in AuxDB `terminate_rules` for one pipeline. Verify graceful stop and checkpoint preservation. Re-run and verify resume from last PK.
-- [ ] **STEP-44** — Test DestinationWriteTune: manually set `throttle_schedule_start = now()` in AuxDB. Verify bulk batch size drops from turbo (5000) to throttle (50) within one tick interval.
-- [ ] **STEP-45** — Run full parallel cold backfill: all 4 brands × 10 cities × 4 entities = 160 pipelines. Monitor via `make watch`. Verify backfill_completion_log fills up and final Elasticsearch `_refresh` fires.
-- [ ] **STEP-46** — Run hot flow for all 4 brands simultaneously. Monitor Redis stream lag via `make watch`. Verify consumer group lag stays under 1000 entries at default seeder throughput.
-- [ ] **STEP-47** — Final validation: query Elasticsearch for order count per sub-brand and compare against source Postgres counts (allowing for backlog and intentional bad records). Verify counts match within ±1%.
+- [ ] **STEP-37** — Run `make setup` (full bootstrap: Docker up → pg_schema → es_schema → auxdb_setup → wal_enabler → seed).
+- [ ] **STEP-38** — Run cold flow smoke test: single brand (zomato_food), single city (delhi), single entity (orders) only. Verify checkpoint written, records indexed in Elasticsearch, backlog count is within expected threshold.
+- [ ] **STEP-39** — Verify intentional bad records from seeder: null customer_id, unmapped city_id, impossible timestamps — all should appear in AuxDB `backlog_records` with correct `error_code`.
+- [ ] **STEP-40** — Run hot flow smoke test: run `wal_enabler` again to confirm slot is active, then insert 100 test orders directly into `zomato_food_db`, verify they appear in Elasticsearch within 5 seconds.
+- [ ] **STEP-41** — Test overlap: insert 10 orders into `zomato_food_db` that have `order_id` values already indexed by the cold flow. Verify Elasticsearch document count does NOT increase (upsert, not insert) and `indexed_at` is updated.
+- [ ] **STEP-42** — Test TerminateRule: artificially set `force_stop = true` in AuxDB `terminate_rules` for one pipeline. Verify graceful stop and checkpoint preservation. Re-run and verify resume from last PK.
+- [ ] **STEP-43** — Test DestinationWriteTune: manually set `throttle_schedule_start = now()` in AuxDB. Verify bulk batch size drops from turbo (5000) to throttle (50) within one tick interval.
+- [ ] **STEP-44** — Run full parallel cold backfill: all 4 brands × 10 cities × 4 entities = 160 pipelines. Verify backfill_completion_log fills up and final Elasticsearch `_refresh` fires.
+- [ ] **STEP-45** — Run hot flow for all 4 brands simultaneously. Verify consumer group lag stays under 1000 entries at default seeder throughput.
+- [ ] **STEP-46** — Final validation: query Elasticsearch for order count per sub-brand and compare against source Postgres counts (allowing for backlog and intentional bad records). Verify counts match within ±1%.
 
 ---
 
-## Part 6 — Live Metrics Monitor
-
-### 6.1 Purpose
-
-Continuous visibility into both cold and hot flow progress simultaneously. The `metrics_watcher` is a standalone Go program that polls AuxDB and Elasticsearch on a configurable interval and prints a live terminal dashboard until Ctrl+C.
-
-### 6.2 What It Monitors
-
-| Section | Data Source | What It Tells You |
-|---|---|---|
-| **Cold checkpoint progress** | `auxdb.pipeline_checkpoints (flow_type=cold)` | Per brand/city/entity: last committed PK, records processed, delta since last tick |
-| **Hot checkpoint progress** | `auxdb.pipeline_checkpoints (flow_type=hot)` | Per brand/city/entity: last Redis stream ID, WAL LSN, events consumed per tick |
-| **Redis stream lag** | Redis `XINFO GROUPS` | Consumer group pending count per stream — key hot flow health signal |
-| **Elasticsearch doc counts** | `GET /platform_orders/_count` | Total indexed documents; breakdown by sub_brand via terms aggregation |
-| **Backlog summary** | `auxdb.backlog_records` | Count by flow_type × failure_stage × status |
-| **Backfill completion** | `auxdb.backfill_completion_log` | How many of 160 brand/entity/city combos have completed cold backfill |
-| **Write tune config** | `auxdb.write_tune_config` | Current batch sizes, active mode (speedify/slowify) |
-| **ES write log** | `auxdb.es_write_log` | Last N bulk index results — success rate, rejection count per batch |
-
-### 6.3 Running It
-
-```bash
-go run ./cmd/metrics_watcher \
-  --auxdb  "host=localhost port=5445 dbname=auxdb user=etl_user password=etl_pass sslmode=disable" \
-  --es     "http://localhost:9200" \
-  --redis  "localhost:6379" \
-  --interval 5s
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--auxdb` | localhost:5445/auxdb | AuxDB Postgres connection string |
-| `--es` | http://localhost:9200 | Elasticsearch base URL |
-| `--redis` | localhost:6379 | Redis address |
-| `--interval` | `5s` | Poll interval |
-
-### 6.4 Sample Output
-
-```
-══════════════════════════════════════════════════════════════════════════════════════
-  ZOMATO PLATFORM ORDER INTELLIGENCE  —  2026-05-11 18:45:02  (tick #24)
-══════════════════════════════════════════════════════════════════════════════════════
-
-  COLD FLOW — CHECKPOINT PROGRESS
-  Brand          City         Entity                   Split   Last PK    Rows (+/tick)
-  ────────────────────────────────────────────────────────────────────────────────────
-  zomato_food    delhi        orders                       1   823,410    823,410 (+8,420)
-  zomato_food    mumbai       orders                       1   744,100    744,100 (+7,820)
-  blinkit        bengaluru    orders                       1   512,340    512,340 (+5,230)
-  hyperpure      delhi        orders                       1   102,100    102,100 (+1,020)
-  district       mumbai       orders                       1    48,230     48,230 (+  480)
-  ...
-
-  COLD BACKFILL COMPLETION:  38 / 160 brand×entity×city combos complete
-
-  HOT FLOW — STREAM LAG
-  Stream                      Pending   Delivered  Consumers
-  ────────────────────────────────────────────────────────────
-  zomato:orders:stream              0   1,204,830          2
-  blinkit:orders:stream            12     843,100          2
-  hyperpure:orders:stream           0      98,200          1
-  district:orders:stream            0      44,500          1
-
-  ELASTICSEARCH DOC COUNTS
-  platform_orders (total):    4,201,840
-  ├── zomato_food:             1,823,410
-  ├── blinkit:                 1,344,100
-  ├── hyperpure:                 986,200
-  └── district:                   48,130
-
-  BACKLOG SUMMARY
-  Flow   Stage          Status        Count
-  ──────────────────────────────────────────
-  cold   Transform      PENDING         312
-  cold   Destination    PENDING          18
-  hot    WALUnwrap      PENDING           4
-  cold   Transform      RESOLVED         89
-
-  Total records processed: 4,201,840  |  Total backlog: 423  |  Backlog rate: 0.010%
-
-  WRITE TUNE CONFIG  —  Normal: 1,000  |  Turbo: 5,000  |  Throttle: 50  |  Mode: SPEEDIFY
-```
-
-### 6.5 What to Watch For
-
-| Signal | Threshold | Likely Cause |
-|---|---|---|
-| Redis stream lag climbing | > 1,000 pending | Elasticsearch slowify active, or Elastic unavailable |
-| Cold checkpoint delta = 0 | Any shard idle 3+ ticks | TerminateRule triggered, source Postgres connection lost |
-| Backlog rate climbing | Approaching 10% | CityZoneMapper failures (check city_mapping reference), status normaliser gap (new brand status added) |
-| Backfill completion stalled | Not incrementing | Cold flow terminate triggered, check backlog for that brand/city |
-| ES doc count < expected | Any | Partial bulk-index failures — check es_write_log rejection counts |
-| WAL slot inactive | Hot flow lag = 0 and stream not growing | Replication slot dropped, re-run wal_enabler |
-
----
-
-## Part 7 — New Patterns vs Case 1
+## Part 6 — New Patterns vs Case 1
 
 This section documents what Case 2 introduces that Case 1 did not have — the architectural teaching moments.
 
@@ -748,5 +651,5 @@ This section documents what Case 2 introduces that Case 1 did not have — the a
 | Redis | 4 streams (one per brand) + 1 consumer group (`elastic_writer_group`). Stage 1 writes, Stage 2 reads. |
 | Destination | Elasticsearch `platform_orders` index — bulk upsert, `_id = {sub_brand}_{order_id}` |
 | AuxDB Tables | 10 operational tables (adds wal_positions, backfill_progress, city_mapping, brand_sla_rules, es_write_log, backfill_completion_log over Case 1's set) |
-| Implementation Steps | 47 steps across 9 phases |
+| Implementation Steps | 46 steps across 9 phases |
 | New patterns vs Case 1 | WAL CDC, Redis Streams as durable buffer, Elasticsearch destination, three-collection architecture, dual-flow overlap resolution, District rideless model |
