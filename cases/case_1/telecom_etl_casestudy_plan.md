@@ -120,7 +120,7 @@ Records that cannot be processed are routed to the **AuxDB** `backlog_records` t
 **Backlog record metadata:**
 - `source_company`, `zone`, `state`, `table_split_index`
 - `batch_id`, `checkpoint_id`
-- `failure_stage` — Transform / Destination / Dedup
+- `failure_stage` — Transform / Destination (the framework's `FailureStage` enum only has `None`/`Transform`/`Destination` — `models/common_model.go`; dedup conflicts are recorded under Destination and distinguished via `error_code`, not a separate framework-native Dedup stage)
 - `error_code`, `error_message`
 - `raw_record` — full original record JSON
 - `retry_count`, `created_at`, `last_attempted_at`
@@ -130,20 +130,20 @@ Records that cannot be processed are routed to the **AuxDB** `backlog_records` t
 
 ### 2.4 TerminateRule
 
-The TerminateRule is registered as a control plane ticker that fires at a configurable interval (stored in AuxDB `terminate_rules` table). Conditions checked on each tick:
+The TerminateRule is registered as a control plane ticker that fires at a configurable interval (`TerminateRuleTune.CheckInterval`, mirrored in AuxDB `terminate_rules` table for operator tuning). Only three of the conditions below are framework-native built-ins, set via dedicated `TerminateRuleTune` fields (`MaxRecords *uint64`, `IdleTimeout *time.Duration`, `MaxPipelineTime *time.Duration` — `models/exit_model.go`); the remaining conditions are hand-rolled inside this case study's single `UserDefinedCheckFunc` rather than separate framework-level rule types:
 
-| Rule | Condition | Action |
-|---|---|---|
-| `ERROR_RATE_BREACH` | Backlog rate > 10% of batch records | Stop pipeline, preserve checkpoint |
-| `SOURCE_UNREACHABLE` | Source MySQL connection error after N retries | Graceful stop, trigger Collection-level retry |
-| `DESTINATION_SATURATION` | Destination write latency > threshold (ms) | Stop, alert, DestinationWriteTune slowify kicks in |
-| `INTEGRITY_VIOLATION` | Critical field (MSISDN) null rate > 5% in batch | Stop, flag shard for source data review |
-| `DUPLICATE_STORM` | Dedup conflict rate > 80% of batch | Stop, escalate to manual review |
-| `IDLE_TIMEOUT` | No records received for > N seconds | Stop, assume source exhausted |
-| `MANUAL_KILL` | Operator sets `force_stop = true` in AuxDB config | Graceful stop at next checkpoint boundary |
-| `MAX_RECORDS_REACHED` | Total records processed >= configured cap | Stop cleanly (useful for incremental runs) |
+| Rule | Condition | Action | Framework-native? |
+|---|---|---|---|
+| `ERROR_RATE_BREACH` | Backlog rate > 10% of batch records | Stop pipeline, preserve checkpoint | Custom — via `UserDefinedCheckFunc` |
+| `SOURCE_UNREACHABLE` | Source MySQL connection error after N retries | Graceful stop, trigger Collection-level retry | Custom — via `UserDefinedCheckFunc` |
+| `DESTINATION_SATURATION` | Destination write latency > threshold (ms) | Stop, alert, DestinationWriteTune slowify kicks in | Custom — via `UserDefinedCheckFunc` |
+| `INTEGRITY_VIOLATION` | Critical field (MSISDN) null rate > 5% in batch | Stop, flag shard for source data review | Custom — via `UserDefinedCheckFunc` |
+| `DUPLICATE_STORM` | Dedup conflict rate > 80% of batch | Stop, escalate to manual review | Custom — via `UserDefinedCheckFunc` |
+| `IDLE_TIMEOUT` | No records received for > N seconds | Stop, assume source exhausted | Built-in (`TerminateRuleTune.IdleTimeout`) |
+| `MANUAL_KILL` | Operator sets `force_stop = true` in AuxDB config | Graceful stop at next checkpoint boundary | Custom — via `UserDefinedCheckFunc` |
+| `MAX_RECORDS` | Total records processed >= configured cap | Stop cleanly (useful for incremental runs) | Built-in (`TerminateRuleTune.MaxRecords`) |
 
-Rules are stored in AuxDB and tunable at runtime without code changes.
+Rules are stored in AuxDB and tunable at runtime without code changes; the AuxDB row values feed the two built-in fields directly and are read by the `UserDefinedCheckFunc` for everything else.
 
 ### 2.5 DestinationWriteTune
 
@@ -168,7 +168,7 @@ The DestinationWriteTune is registered as a separate control plane ticker. It dy
 - `destination_latency_threshold_ms`
 - `concurrency_limit`
 
-The `UserDefinedCheckFunc` in the `DestinationWriteTune` reads these config values from AuxDB on each tick and calls `SetDestinationWriteBatchSize` accordingly.
+The `UserDefinedCheckFunc` in the `DestinationWriteTune` reads these config values from AuxDB on each tick and returns a `*DestinationWriteActionTune{NewBatchSize *int}` accordingly (nil = no change); the engine applies that new batch size to the running pipeline (there is no `SetDestinationWriteBatchSize` call made by client code itself).
 
 ### 2.6 Auxiliary DB
 
@@ -257,31 +257,33 @@ Priority order: Retry → Pipeline → Materialize next Flow
 
 ### 4.3 Flow Orchestrator (to be implemented — PID: new)
 
-Controls how many Flows (zone×company combos) execute concurrently.
+Materializes the 20 company×zone Flow replicas by returning one `FlowOrchestratorTune` per replica — the real shape (`models/orchestrator_model.go`) carries per-replica naming/context, not concurrency knobs:
 
 ```go
-// FlowOrchestratorTune controls global flow-level concurrency
+// FlowOrchestratorTune — one per materialized Flow replica
 type FlowOrchestratorTune struct {
-    MaxConcurrentFlows int      // e.g., 8 — limits MySQL source load
-    FlowPriority       []string // e.g., run Vodafone flows before others
+    ReplicaProps map[string]any // e.g. {"company": "vodafone", "zone": "north"}
+    ParentName   string         // template flow name
+    ReplicaName  string         // materialized name, e.g. "vodafone_north"
 }
 ```
 
-This prevents overwhelming the 4 MySQL source servers simultaneously.
+Actual concurrency limiting (how many Flows run at once, to avoid overwhelming the 4 MySQL source servers) is enforced by the `ExecutionQueueManager`'s bounded `FlowQueue` (§4.2), not by fields on this tune.
 
 ### 4.4 Pipeline Orchestrator (PID: 2 — to be implemented)
 
-Controls how many Pipelines (state-level) run concurrently within a single Flow.
+Materializes each Flow's state-level Pipeline replicas by returning one `PipelineOrchestratorTune` per replica — same real shape as `FlowOrchestratorTune` (`models/orchestrator_model.go`):
 
 ```go
-// PipelineOrchestratorTune controls per-flow pipeline concurrency
+// PipelineOrchestratorTune — one per materialized state-level Pipeline replica
 type PipelineOrchestratorTune struct {
-    MaxConcurrentPipelines int // e.g., 3 states per zone at a time
-    BatchSize              int // initial destination write batch size
+    ReplicaProps map[string]any // e.g. {"state": "up", "zone": "north"}
+    ParentName   string         // template pipeline name, e.g. "state"
+    ReplicaName  string         // materialized name, e.g. "up_north"
 }
 ```
 
-Config read from AuxDB `write_tune_config` at orchestration time.
+Actual concurrency limiting (how many Pipelines run at once within a Flow) is enforced by the `ExecutionQueueManager`'s `PipelineQueue` (§4.2), not by fields on this tune. Initial destination write batch size is instead sourced from AuxDB `write_tune_config` at orchestration time and applied via `DestinationWriteTune`/`DestinationWriteHandle` (§2.5).
 
 ### 4.5 Peak Parallelism Model
 
@@ -365,13 +367,13 @@ Each lane writes to a non-overlapping Postgres partition — zero contention.
 
 - [ ] **STEP-22** — Implement `Checkpoint` function — write shard state (company, zone, state, split index, last PK, batch ID, phase, timestamp) to AuxDB `pipeline_checkpoints`; implement resume logic in source connector to read last checkpoint and start from `last_processed_pk + 1`
 - [ ] **STEP-23** — Implement `Backlog` function — write failed records with full metadata (source, stage, error code, raw record JSON, retry count) to AuxDB `backlog_records`; define `BacklogTune.Action` for each failure type (Continue / Stop)
-- [ ] **STEP-24** — Implement `TerminateRule` — register all 8 termination conditions (error rate, source unreachable, destination saturation, integrity violation, duplicate storm, idle timeout, manual kill, max records); read thresholds from AuxDB `terminate_rules` on each tick
+- [ ] **STEP-24** — Implement `TerminateRule` — wire the 2 framework built-ins (`IDLE_TIMEOUT`, `MAX_RECORDS` via `TerminateRuleTune.IdleTimeout`/`MaxRecords`) plus the remaining 6 conditions (error rate, source unreachable, destination saturation, integrity violation, duplicate storm, manual kill) hand-rolled in a single `UserDefinedCheckFunc`; read thresholds from AuxDB `terminate_rules` on each tick
 - [ ] **STEP-25** — Implement `DestinationWriteTune` — `UserDefinedCheckFunc` reads `write_tune_config` from AuxDB on each tick; implements speedify (high batch size, index disable, bulk insert) and slowify (low batch size, inter-batch sleep, concurrency cap) modes with time-of-day scheduling
 
 ### Phase 5 — Orchestration
 
-- [ ] **STEP-26** — Implement `FlowOrchestrator` (new PID) — controls max concurrent flows globally; reads `max_concurrent_flows` from AuxDB; optionally enforces flow priority order
-- [ ] **STEP-27** — Implement `PipelineOrchestrator` (PID: 2) — controls max concurrent pipelines per flow; reads `max_concurrent_pipelines` from AuxDB `write_tune_config`; returns `PipelineOrchestratorTune` array
+- [ ] **STEP-26** — Implement `FlowOrchestrator` (new PID) — materializes the 20 company×zone Flow replicas, returning a `FlowOrchestratorTune` (`ParentName`/`ReplicaName`/`ReplicaProps`) per replica; actual max-concurrent-flows limiting is the `ExecutionQueueManager`'s bounded `FlowQueue`, configured via job/collection settings, not a field on this tune
+- [ ] **STEP-27** — Implement `PipelineOrchestrator` (PID: 2) — materializes each Flow's state-level Pipeline replicas, returning a `PipelineOrchestratorTune` (`ParentName`/`ReplicaName`/`ReplicaProps`) array; reads initial destination write batch size from AuxDB `write_tune_config` and applies it via `DestinationWriteTune`; actual max-concurrent-pipelines limiting is the `ExecutionQueueManager`'s `PipelineQueue`, not a field on this tune
 - [ ] **STEP-28** — Build `collection.json` for the full telecom migration: 20 flows (4 companies × 5 zones), each with 6–9 state pipelines, correct connector PIDs, transformer PIDs, checkpoint/backlog/terminate PIDs, and AuxDB hub connections
 
 ### Phase 6 — Backlog Reprocessing Flow
