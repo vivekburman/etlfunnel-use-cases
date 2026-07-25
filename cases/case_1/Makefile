@@ -10,7 +10,9 @@
 #   make down        — stop and remove containers (keeps volumes)
 #   make reset       — stop containers AND destroy volumes (DESTRUCTIVE)
 
+ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
+endif
 .SHELLFLAGS := -euo pipefail -c
 
 export GOTMPDIR := $(CURDIR)/tmp

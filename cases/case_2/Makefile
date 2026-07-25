@@ -17,7 +17,9 @@
 #                       The separate ETL pipeline reads those slots → Redis → ES.
 #                       Override: make hot BATCH=200 HOT_INTERVAL=5s
 
+ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
+endif
 .SHELLFLAGS := -euo pipefail -c
 
 export GOTMPDIR := $(CURDIR)/tmp

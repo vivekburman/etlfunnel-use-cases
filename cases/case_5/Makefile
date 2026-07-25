@@ -39,7 +39,9 @@
 #   [Windows] make oracle-seed-hot   (terminal 2 — continuous Oracle feed)
 #   [Windows] Start flows: pid=34 → pid=35 → pid=32
 
+ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
+endif
 .SHELLFLAGS := -euo pipefail -c
 
 export GOTMPDIR := $(CURDIR)/tmp
