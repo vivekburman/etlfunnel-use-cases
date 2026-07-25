@@ -8,20 +8,12 @@
 #
 # USAGE:
 #   make up           — start AuxDB + Kafka + Cassandra containers
-#   make deps         — download Go module dependencies
-#   make auxdb        — create AuxDB tables (run once after 'up')
-#   make cassandra    — create Cassandra keyspace + table (run once after 'up')
+#   make setup        — full bootstrap: up → AuxDB tables → Cassandra keyspace/table
 #   make seed         — start Zepto REST API mock server (:11334) with realistic fault mix
 #   make seed-stop    — stop the mock seeder
-#   make seed-backlog — insert synthetic backlog rows into AuxDB (instant non-zero Loki widgets)
-#   make setup        — full bootstrap: up → auxdb
-#   make watch        — live metrics dashboard (polls AuxDB, Ctrl+C to exit)
-#                       Override: make watch INTERVAL=10s
-#   make logs         — tail all container logs
-#   make status       — show container health
+#   make seed-backlog — insert synthetic backlog rows into AuxDB
 #   make down         — stop containers (keep volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
-#   make lint         — run golangci-lint
 #
 # SEED OVERRIDES:
 #   make seed TOTAL_EVENTS=5000 SEEDER_PORT=11334
@@ -49,21 +41,13 @@ FAULT_RATE   ?= 5
 
 BACKLOG_N    ?= 20
 
-INTERVAL     ?= 5s
-
-.PHONY: up down reset wait-healthy deps auxdb cassandra seed seed-stop \
-        seed-backlog setup watch logs status lint
+.PHONY: up down reset setup seed seed-stop seed-backlog
 
 ## Start AuxDB + Kafka + Cassandra containers
 up:
 	@echo ">>> Starting Docker containers..."
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ">>> Waiting for all services to be healthy..."
-	$(MAKE) wait-healthy
-
-## Wait until all containers report healthy
-wait-healthy:
-	@echo "  Checking health..."
 	@for svc in zepto_auxdb zepto_kafka zepto_cassandra; do \
 		printf "  Waiting for $$svc "; \
 		for i in $$(seq 1 60); do \
@@ -83,22 +67,14 @@ reset:
 	docker compose -f $(COMPOSE_FILE) down -v
 	@echo ">>> Volumes destroyed"
 
-## Download Go module dependencies
-deps:
+## Full bootstrap: start containers → AuxDB tables → Cassandra keyspace/table
+setup: up
 	@echo ">>> Downloading Go dependencies..."
 	go mod download
 	go mod tidy
-	@echo ">>> Dependencies ready"
-
-## Create AuxDB tables
-auxdb:
 	@echo ">>> Setting up AuxDB..."
 	go build -o $(GOTMPDIR)/auxdb_init$(GOEXE) ./cmd/auxdb_setup
 	$(GOTMPDIR)/auxdb_init$(GOEXE) -dsn "$(AUXDB_DSN)"
-	@echo ">>> AuxDB ready"
-
-## Create Cassandra keyspace and table
-cassandra:
 	@echo ">>> Setting up Cassandra keyspace and table..."
 	docker exec zepto_cassandra cqlsh -e "\
 		CREATE KEYSPACE IF NOT EXISTS zepto_events \
@@ -122,7 +98,10 @@ cassandra:
 		                    'compaction_window_unit': 'DAYS', \
 		                    'compaction_window_size': 1} \
 		  AND comment = 'Order lifecycle events. TTL=90d set per-row by pipeline.';"
-	@echo ">>> Cassandra ready"
+	@echo ">>> Setup complete."
+	@echo ">>> Tip: run 'make seed-backlog' to pre-populate backlog tables."
+	@echo ">>> Run 'make seed' to start the Zepto mock API (includes 5% fault records by default)."
+	@echo ">>> Then start Flow 2 (pid=29) followed by Flow 1 (pid=28) in streamcraftexecution."
 
 ## Start Zepto REST API mock server in the background (stops any existing instance first)
 seed: seed-stop
@@ -134,11 +113,11 @@ seed: seed-stop
 	@echo ">>> Seeder listening on :$(SEEDER_PORT)"
 	@echo ">>> API: GET http://localhost:$(SEEDER_PORT)/api/v2/order-events?limit=500"
 
-## Seed both AuxDB backlog tables with synthetic failed records (instant non-zero Loki widgets)
+## Seed both AuxDB backlog tables with synthetic failed records
 seed-backlog:
 	@echo ">>> Seeding backlog tables with $(BACKLOG_N) synthetic failures each..."
 	go run ./cmd/backlog_seeder -n $(BACKLOG_N)
-	@echo ">>> Done. Run 'make watch' to verify."
+	@echo ">>> Done."
 
 ## Stop the mock seeder
 seed-stop:
@@ -149,32 +128,3 @@ seed-stop:
 	else \
 		echo ">>> No seeder PID file found"; \
 	fi
-
-## Full bootstrap: start containers → auxdb → cassandra
-setup: up auxdb cassandra
-	@echo ">>> Setup complete."
-	@echo ">>> Tip: run 'make seed-backlog' to pre-populate backlog tables for Loki widget coverage."
-	@echo ">>> Run 'make seed' to start the Zepto mock API (includes 5% fault records by default)."
-	@echo ">>> Then start Flow 2 (pid=29) followed by Flow 1 (pid=28) in streamcraftexecution."
-
-## Live metrics dashboard
-watch:
-	AUXDB_DSN="$(AUXDB_DSN)" \
-	go run ./cmd/metrics_watcher --interval $(INTERVAL)
-
-## Tail container logs
-logs:
-	docker compose -f $(COMPOSE_FILE) logs -f
-
-## Show container health
-status:
-	@docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
-		--filter name=zepto_auxdb \
-		--filter name=zepto_kafka \
-		--filter name=zepto_cassandra
-
-## Run golangci-lint
-lint:
-	@echo ">>> Running linter..."
-	golangci-lint run ./...
-	@echo ">>> Lint done"

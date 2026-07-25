@@ -547,7 +547,7 @@ cmd/backlog_seeder/
 
 ### 7.5 Backlog Seeder
 
-`cmd/backlog_seeder` inserts synthetic failure rows directly into `fc_snapshot_backlog` and `fc_movement_backlog`, bypassing the pipeline — same purpose as Case 4's backlog seeder: the metrics dashboard shows non-zero backlog counts immediately after `make setup`, without needing a full fault-injected pipeline run first.
+`cmd/backlog_seeder` inserts synthetic failure rows directly into `fc_snapshot_backlog` and `fc_movement_backlog`, bypassing the pipeline — same purpose as Case 4's backlog seeder: it populates both backlog tables with representative failure data immediately after `make setup`, without needing a full fault-injected pipeline run first.
 
 ```bash
 make seed-backlog          # inserts 20 rows into each backlog table
@@ -556,77 +556,16 @@ make seed-backlog N=50     # inserts 50 rows into each backlog table
 
 ---
 
-## Part 8 — Metrics Dashboard
-
-`cmd/metrics_watcher` polls AuxDB and MongoDB on an interval and displays the state of both flows.
-
-### 8.1 Dashboard Sections
-
-| Section | Source | What It Shows |
-|---|---|---|
-| **Flow 1 snapshot progress** | `fc_snapshot_progress` | `directory`, `last_part`, `last_row`, `status`, `updated_at` — one row per day processed |
-| **Flow 2 movement progress** | `fc_movement_progress` | `last_part`, `last_row`, `updated_at` — confirms Flow 2 is still advancing across the growing directory |
-| **MongoDB counts** | `fc_inventory.inventory_snapshots`, `fc_inventory.stock_movements` | `countDocuments()` per collection |
-| **Backlog counts** | `fc_snapshot_backlog`, `fc_movement_backlog` | Row counts; recent entries with `failure_stage` and `error_message` |
-
-### 8.2 Running It
-
-```bash
-go run ./cmd/metrics_watcher             # defaults: 5s interval, local AuxDB + MongoDB
-make watch                               # same
-make watch INTERVAL=10s                  # 10-second poll
-```
-
-### 8.3 Sample Output
-
-```
-=== FC Inventory Ops Pipeline — Live Metrics [09:41:12] ===
-
-── Flow 1: Parquet → MongoDB (snapshot progress) ────────────────────────────
-  directory=dt=2026-07-10   part=1   row=412   status=in_progress   updated=09:41:10
-
-── Flow 2: Avro → MongoDB (movement progress) ───────────────────────────────
-  directory=/data/wms_stock_movements   part=6   row=213   updated=09:41:09
-
-── MongoDB collection counts ────────────────────────────────────────────────
-  fc_inventory.inventory_snapshots : 1,138
-  fc_inventory.stock_movements     : 3,204
-
-── Backlogs ──────────────────────────────────────────────────────────────────
-  fc_snapshot_backlog (Flow 1 failed rows)    : 4
-  fc_movement_backlog (Flow 2 failed records) : 6
-
-(refreshes every few seconds — Ctrl+C to exit)
-```
-
-### 8.4 Signals to Watch
-
-| Signal | Threshold | Likely Cause |
-|---|---|---|
-| Snapshot progress stuck mid-directory | 3+ consecutive ticks | Flow 1 stalled — MongoDB unreachable, or a bad row wedged in a fixed-size batch |
-| Movement progress not advancing | No change since the last `make seed-movement` | Normal — Flow 2 already finished the parts that existed at its last invocation; investigate only if new part files exist on disk and a re-run still doesn't advance the checkpoint |
-| Snapshot backlog growing | Rate > 5% of rows | Fault rate high, or `transformer_2` (QuantityGuard) threshold misconfigured |
-| Movement backlog growing | Rate > 5% of records | Unexpected `movement_type` values — check whether WMS introduced a new enum member upstream (`transformer_5`) |
-
----
-
-## Part 9 — Makefile Targets
+## Part 8 — Makefile Targets
 
 ```makefile
 make up             # Start AuxDB + MongoDB containers and wait for healthy
-make deps           # Download Go module dependencies
-make auxdb          # Create AuxDB tables (run once after 'up')
-make mongo-init     # Create MongoDB unique indexes on both collections
 make seed-snapshot  # Write today's Parquet snapshot directory
 make seed-movement  # Append a new batch of Avro movement part files
 make seed-backlog   # Insert synthetic backlog rows into AuxDB (N=20 per table by default)
 make setup          # Full bootstrap: up → auxdb → mongo-init
-make watch          # Live metrics dashboard (polls AuxDB + MongoDB, Ctrl+C to exit)
-make logs           # Tail all container logs
-make status         # Show container health
 make down           # Stop containers (keep volumes)
 make reset          # Stop containers AND destroy volumes (DESTRUCTIVE)
-make lint           # Run golangci-lint
 ```
 
 **Seed overrides:**
@@ -647,7 +586,7 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 
 ---
 
-## Part 10 — Step-by-Step Implementation Tasks
+## Part 9 — Step-by-Step Implementation Tasks
 
 ### Phase 1 — Infrastructure Setup
 
@@ -703,22 +642,21 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 
 ### Phase 8 — Observability
 
-- [ ] **STEP-32** — Implement `cmd/metrics_watcher/main.go` — polls AuxDB (`pgx/v5`) and MongoDB (`countDocuments`) on a configurable `--interval` (default 5s). Sections per §8.1. Clears screen each tick (`\033[H\033[2J`). Exits cleanly on `SIGINT`/`SIGTERM`.
-- [ ] **STEP-33** — Add structured logging at key events: directory scan started (directory, resolved `Files` count, `StartAfterPart`, `StartAfterRow`), batch delivered (count, highest `Meta[MetaFilePart]`/`Meta[MetaFileRow]`), MongoDB upsert batch committed (count, collection, latency), progress checkpoint saved, backlog record inserted (stage, error), `TerminateRule` fired (rule name, flow).
+- [ ] **STEP-32** — Add structured logging at key events: directory scan started (directory, resolved `Files` count, `StartAfterPart`, `StartAfterRow`), batch delivered (count, highest `Meta[MetaFilePart]`/`Meta[MetaFileRow]`), MongoDB upsert batch committed (count, collection, latency), progress checkpoint saved, backlog record inserted (stage, error), `TerminateRule` fired (rule name, flow).
 
 ### Phase 9 — End-to-End Test Run
 
-- [ ] **STEP-34** — Run `make setup` (Docker up → wait healthy → `make auxdb` → `make mongo-init`). Verify all 4 AuxDB tables exist via `psql`. Verify both MongoDB indexes exist via `mongosh --eval "db.inventory_snapshots.getIndexes()"`.
-- [ ] **STEP-35** — Run `make seed-snapshot` with defaults. Verify `<FC_SNAPSHOT_DIR>/dt=<today>/` contains `part-00000.parquet` and `part-00001.parquet`.
-- [ ] **STEP-36** — Run `make seed-movement` with defaults. Verify `<FC_MOVEMENT_DIR>/` contains `part-00000.avro` through `part-00003.avro`.
-- [ ] **STEP-37** — Run `make seed-backlog`. Verify both AuxDB backlog tables contain 20 rows each. Run `make watch` and confirm non-zero backlog counts.
-- [ ] **STEP-38** — Start Flow 1 (pid=1). Verify it processes both Parquet parts and its source channel closes on its own — no terminate-rule stop. Confirm `fc_snapshot_progress.status = 'complete'` and `inventory_snapshots` has ~1,425 documents (1,500 total minus ~37 Fault A silent drops at 5% split evenly across two fault types, ~37 each).
-- [ ] **STEP-39** — Start Flow 2 (pid=2). Verify it processes all 4 Avro parts, then its channel closes on its own once they're exhausted (this run is finished, not the directory). Confirm `stock_movements` has ~1,900 documents (2,000 total minus ~100 Fault A silent drops).
-- [ ] **STEP-40** — Verify fault handling: confirm `fc_snapshot_backlog` has ~37 rows with `failure_stage=transform` and `transformer_2` error text; confirm `fc_movement_backlog` has ~50 rows with `transformer_5` unknown-movement_type errors.
-- [ ] **STEP-41** — Test checkpoint/resume for Flow 1: kill it mid-scan. Note `(last_part, last_row)` in `fc_snapshot_progress`. Restart. Confirm it resumes from that exact position — `inventory_snapshots` document count does not change for rows already upserted (idempotent by `_id`).
-- [ ] **STEP-42** — Test the "new directory each day" model: run `make seed-snapshot SNAPSHOT_DATE=<tomorrow>`, then start Flow 1 again (its orchestrator re-resolves `directory` from `SNAPSHOT_DATE`/today). Confirm a **second, independent** row appears in `fc_snapshot_progress` for the new directory, starting from `(0, 0)`, while yesterday's row remains untouched at `status='complete'`.
-- [ ] **STEP-43** — Test the "flat, growing directory" model: after STEP-39 finishes, run `make seed-movement NEW_MOVEMENTS=500` to append two more parts. Restart Flow 2. Confirm — via `record.Meta[MetaFilePart]` on delivered records, or the `GenerateScan` log line showing the resolved `Files` count and `StartAfterPart` — that files before the checkpoint index are **skipped entirely, not re-opened**, and only the newly appended parts are read.
-- [ ] **STEP-44** — Full pipeline run: `make reset` → `make setup` → `make seed-snapshot` → `make seed-movement` → start Flow 1 → start Flow 2 → monitor via `make watch` until both channels close on their own. Verify final MongoDB counts and both backlog tables match the expected fault-rate math from STEP-38/39/40.
+- [ ] **STEP-33** — Run `make setup` (Docker up → wait healthy → `make auxdb` → `make mongo-init`). Verify all 4 AuxDB tables exist via `psql`. Verify both MongoDB indexes exist via `mongosh --eval "db.inventory_snapshots.getIndexes()"`.
+- [ ] **STEP-34** — Run `make seed-snapshot` with defaults. Verify `<FC_SNAPSHOT_DIR>/dt=<today>/` contains `part-00000.parquet` and `part-00001.parquet`.
+- [ ] **STEP-35** — Run `make seed-movement` with defaults. Verify `<FC_MOVEMENT_DIR>/` contains `part-00000.avro` through `part-00003.avro`.
+- [ ] **STEP-36** — Run `make seed-backlog`. Verify both AuxDB backlog tables contain 20 rows each via a direct AuxDB query.
+- [ ] **STEP-37** — Start Flow 36 (pid=36). Verify it processes both Parquet parts and its source channel closes on its own — no terminate-rule stop. Confirm `fc_snapshot_progress.status = 'complete'` and `inventory_snapshots` has ~1,425 documents (1,500 total minus ~37 Fault A silent drops at 5% split evenly across two fault types, ~37 each).
+- [ ] **STEP-38** — Start Flow 37 (pid=37). Verify it processes all 4 Avro parts, then its channel closes on its own once they're exhausted (this run is finished, not the directory). Confirm `stock_movements` has ~1,900 documents (2,000 total minus ~100 Fault A silent drops).
+- [ ] **STEP-39** — Verify fault handling: confirm `fc_snapshot_backlog` has ~37 rows with `failure_stage=transform` and `transformer_98` error text; confirm `fc_movement_backlog` has ~50 rows with `transformer_101` unknown-movement_type errors.
+- [ ] **STEP-40** — Test checkpoint/resume for Flow 36: kill it mid-scan. Note `(last_part, last_row)` in `fc_snapshot_progress`. Restart. Confirm it resumes from that exact position — `inventory_snapshots` document count does not change for rows already upserted (idempotent by `_id`).
+- [ ] **STEP-41** — Test the "new directory each day" model: run `make seed-snapshot SNAPSHOT_DATE=<tomorrow>`, then start Flow 36 again (its orchestrator re-resolves `directory` from `SNAPSHOT_DATE`/today). Confirm a **second, independent** row appears in `fc_snapshot_progress` for the new directory, starting from `(0, 0)`, while yesterday's row remains untouched at `status='complete'`.
+- [ ] **STEP-42** — Test the "flat, growing directory" model: after STEP-38 finishes, run `make seed-movement NEW_MOVEMENTS=500` to append two more parts. Restart Flow 37. Confirm — via `record.Meta[MetaFilePart]` on delivered records, or the `GenerateScan` log line showing the resolved `Files` count and `StartAfterPart` — that files before the checkpoint index are **skipped entirely, not re-opened**, and only the newly appended parts are read.
+- [ ] **STEP-43** — Full pipeline run: `make reset` → `make setup` → `make seed-snapshot` → `make seed-movement` → start Flow 36 → start Flow 37 → wait until both channels close on their own. Verify final MongoDB counts and both backlog tables match the expected fault-rate math from STEP-37/38/39.
 
 ---
 
@@ -745,5 +683,5 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 | AuxDB tables | 4: `fc_snapshot_progress`, `fc_snapshot_backlog`, `fc_movement_progress`, `fc_movement_backlog` |
 | Termination | Both flows just let `ReadByFullScan`'s channel close on its own once their `GenerateScan`-bounded `Files` list is exhausted; `terminate_1`/`terminate_2` register only a `MaxPipelineTime` safety net (30 min / 15 min), no custom exhausted-polling check func. Flow 1 additionally marks `fc_snapshot_progress.status='complete'` on a clean finish; Flow 2 has no such terminal state — it's simply re-invoked periodically over the same growing directory. |
 | Seeder | Two Go CLI tools writing real Parquet/Avro part files to disk (not an HTTP mock) — `parquet-go` (`parquet.WriteFile`) and `hamba/avro/v2/ocf` |
-| Implementation steps | 44 steps across 9 phases |
+| Implementation steps | 43 steps across 9 phases |
 | New patterns vs Cases 1–5 | File-based sources with no live API/DB/stream to poll; client-side file discovery (`GenerateScan` builds `Files` itself via `helper.ListParts` — the connector never scans a directory) with resume as an index into that list rather than cursor/offset/WAL; `Record.Meta`/`Record.Data` separation, with the full `*models.Record` (not just `Data`) threaded through the transformer chain and into `CheckpointProps`/`BacklogProps`, so file position is read straight off `Meta` with no copy step — `Meta` still stops at the destination boundary and never reaches the MongoDB document; a fixed connector `Directory` combined with a client-computed sub-folder to handle a rotating (daily) source directory, vs. a non-rotating (flat) one; a destination connector type (`DBMongoConfig`) whose config fixes the target collection, forcing one connector per collection rather than one shared connector across flows; termination reduced to a `MaxPipelineTime` safety net with no custom check func, since a bounded one-shot file scan — unlike a REST/Kafka connection — closes its own channel when done; MongoDB as a document destination for two structurally distinct feeds; no inter-flow ordering or shared bus |

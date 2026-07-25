@@ -389,119 +389,18 @@ Each lane writes to a non-overlapping Postgres partition — zero contention.
 
 - [ ] **STEP-34** — Add structured logging (already in framework via `zap`) at all key events: shard start/end, checkpoint written, backlog routed, termination triggered, tune adjusted, flow completed
 - [ ] **STEP-35** — Expose pipeline metrics (total records, backlog rate, checkpoint lag, destination write latency) — suitable for OpenTelemetry integration (framework has KAN-16 OTEL branch)
-- [ ] **STEP-36** — Build a simple reconciliation dashboard query set against AuxDB tables to give a live view of migration progress per company, zone, and state
 
 ### Phase 9 — End-to-End Test Run
 
-- [ ] **STEP-37** — Run a single pipeline in isolation (Vodafone → North → UP) as smoke test — validate checkpoint, backlog, transform, and destination write all work correctly
-- [ ] **STEP-38** — Introduce intentional bad records (null MSISDN, invalid plan codes, duplicate MSISDNs across two companies) and verify backlog routing and dedup handling
-- [ ] **STEP-39** — Test TerminateRule triggers — artificially breach error rate threshold and verify graceful stop + checkpoint preservation
-- [ ] **STEP-40** — Test DestinationWriteTune — simulate off-peak (speedify) and peak hours (slowify) and verify batch size changes dynamically
-- [ ] **STEP-41** — Run full parallel execution: all 20 flows, all ~140 pipelines — monitor queue throughput, destination partition health, AuxDB backlog volume
-- [ ] **STEP-42** — Simulate mid-run failure: kill one pipeline mid-shard, verify checkpoint allows clean resume from last committed PK
-- [ ] **STEP-43** — Run backlog reprocessing flow on all PENDING backlog records — verify resolution rate and ABANDONED count
-- [ ] **STEP-44** — Run full reconciliation suite (STEP-32 to STEP-33) — verify source vs raw destination counts match within acceptable tolerance
-- [ ] **STEP-45** — Final sign-off: all raw records validated, all checkpoints marked complete, reconciliation log clean
-
----
-
-## Part 6 — Live Metrics Monitor
-
-### 6.1 Purpose
-
-While the pipeline runs you need continuous visibility into whether records are actually moving from source to destination, whether the checkpoint is advancing, and whether the backlog is growing. The metrics watcher is a standalone Go program that polls AuxDB and the destination DB on a configurable interval and prints a live terminal dashboard until you press Ctrl+C.
-
-### 6.2 What It Monitors
-
-| Section | Data Source | What It Tells You |
-|---|---|---|
-| **Checkpoint progress** | `auxdb.pipeline_checkpoints` | Per-shard: last committed PK, records processed, delta since last tick (throughput) |
-| **Active pipelines** | `auxdb.pipeline_checkpoints` | How many shards had a checkpoint written in the last 30 s — confirms goroutines are live |
-| **Destination row counts** | `destination_db.raw.*` | How many rows have landed per table — validates source → destination flow |
-| **Backlog summary** | `auxdb.backlog_records` | Count by status (PENDING / IN_RETRY / RESOLVED / ABANDONED) × failure stage (Transform / Destination) |
-| **Backlog rate** | Both | `total_backlog / total_records_processed` — the key health signal; TerminateRule fires at >10% |
-| **Write tune config** | `auxdb.write_tune_config` | Current Normal / Turbo / Throttle batch sizes — shows whether speedify or slowify is active |
-
-### 6.3 Throughput Signal
-
-The watcher tracks `records_processed` per shard key (`company|zone|state|split`) across ticks. The delta column in the checkpoint table shows how many records each shard committed since the previous poll. A shard showing `idle` for more than 2–3 consecutive ticks while still `IN_PROGRESS` status means either the source is slow, a TerminateRule has paused it, or the goroutine has exited unexpectedly.
-
-### 6.4 Running It
-
-```bash
-go run ./cmd/metrics_watcher \
-  --auxdb  "host=localhost port=5435 dbname=auxdb user=etl_user password=etl_pass sslmode=disable" \
-  --destdb "host=localhost port=5434 dbname=destination_db user=etl_user password=etl_pass sslmode=disable" \
-  --interval 5s
-```
-
-Flags:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--auxdb` | localhost:5435/auxdb | AuxDB Postgres connection string |
-| `--destdb` | localhost:5434/destination_db | Destination DB connection string |
-| `--interval` | `5s` | Poll interval — accepts Go duration syntax (5s, 10s, 1m) |
-
-### 6.5 Sample Output
-
-```
-══════════════════════════════════════════════════════════════════════════════════════════
-  TELECOM ETL METRICS  —  2026-05-09 15:32:01  (tick #12)
-══════════════════════════════════════════════════════════════════════════════════════════
-
-  CHECKPOINT PROGRESS
-  Company        Zone         State            Split      Last PK    Batch  Phase          Status       Rows (+/tick)
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  aircel         central      chhattisgarh         1       823,410   56732  Transform/Load IN_PROGRESS  823,410 (+8,420)
-  aircel         central      mp                   1       742,100   56731  Transform/Load IN_PROGRESS  742,100 (+7,820)
-  vodafone       north        up                   1     1,024,000   56740  Transform/Load IN_PROGRESS  1,024,000 (+9,100)
-  vodafone       north        up                   2       120,340   56741  Transform/Load IN_PROGRESS  120,340 (+1,200)
-  idea           south        kerala               1       501,230   56738  Transform/Load IN_PROGRESS  501,230 (idle)
-  ...
-
-  ACTIVE PIPELINES (updated in last 30s): 14 / 20
-
-  DESTINATION ROW COUNTS (raw schema)
-  customers:            3,245,780
-  subscriptions:        3,240,100
-  billing_accounts:     3,238,900
-  sim_inventory:        2,987,400
-  port_history:         1,340,200
-
-  BACKLOG SUMMARY  (status × failure_stage)
-  Status       Stage           Count
-  ──────────────────────────────────────
-  PENDING      Transform           423
-  PENDING      Destination          12
-  IN_RETRY     Transform            18
-  RESOLVED     Transform           102
-
-  Total records processed: 12,450,000  |  Total backlog: 555  |  Backlog rate: 0.0045%
-
-  WRITE TUNE CONFIG  —  Normal: 1,000  |  Turbo: 5,000  |  Throttle: 100
-```
-
-### 6.6 What to Watch For
-
-| Signal | Threshold | Likely Cause |
-|---|---|---|
-| Backlog rate climbing | Approaching 10% | Transformer failures, plan code mismatches, dedup storms — check `failure_stage` breakdown |
-| Shard `idle` for 3+ ticks | Any | TerminateRule triggered, source connection dropped, goroutine panic |
-| Destination count stalled | Any | Destination write failures, `write_tune_config` set to Throttle, destination saturation |
-| Active pipelines < expected | < flows × pipelines | Some goroutines exited — cross-check `status = COMPLETE` vs `IN_PROGRESS` in checkpoint table |
-| Write tune Throttle active | Batch size = Throttle | Peak-hours slowify kicked in — normal if within scheduled window, abnormal otherwise |
-
-### 6.7 Implementation Location
-
-```
-cases/case_1/
-  cmd/
-    metrics_watcher/
-      main.go     ← standalone Go program, part of the case_1 module
-```
-
-No new dependencies — uses `github.com/jackc/pgx/v5` already in `go.mod`.
+- [ ] **STEP-36** — Run a single pipeline in isolation (Vodafone → North → UP) as smoke test — validate checkpoint, backlog, transform, and destination write all work correctly
+- [ ] **STEP-37** — Introduce intentional bad records (null MSISDN, invalid plan codes, duplicate MSISDNs across two companies) and verify backlog routing and dedup handling
+- [ ] **STEP-38** — Test TerminateRule triggers — artificially breach error rate threshold and verify graceful stop + checkpoint preservation
+- [ ] **STEP-39** — Test DestinationWriteTune — simulate off-peak (speedify) and peak hours (slowify) and verify batch size changes dynamically
+- [ ] **STEP-40** — Run full parallel execution: all 20 flows, all ~140 pipelines — monitor queue throughput, destination partition health, AuxDB backlog volume
+- [ ] **STEP-41** — Simulate mid-run failure: kill one pipeline mid-shard, verify checkpoint allows clean resume from last committed PK
+- [ ] **STEP-42** — Run backlog reprocessing flow on all PENDING backlog records — verify resolution rate and ABANDONED count
+- [ ] **STEP-43** — Run full reconciliation suite (STEP-32 to STEP-33) — verify source vs raw destination counts match within acceptable tolerance
+- [ ] **STEP-44** — Final sign-off: all raw records validated, all checkpoints marked complete, reconciliation log clean
 
 ---
 
@@ -521,4 +420,4 @@ No new dependencies — uses `github.com/jackc/pgx/v5` already in `go.mod`.
 | Destination | Postgres `raw` schema — fast-write landing zone, no constraints |
 | Partitioning | Zone → State → Batch range (declarative, zero write contention) |
 | AuxDB Tables | 7 operational tables (checkpoints, backlog, dedup, plan map, rules, config, reconciliation) |
-| Implementation Steps | 45 steps across 9 phases |
+| Implementation Steps | 44 steps across 9 phases |

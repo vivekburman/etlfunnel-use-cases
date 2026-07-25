@@ -4,22 +4,11 @@
 #
 # USAGE:
 #   make up           — start SQL Server + AuxDB containers
-#   make deps         — download Go module dependencies
-#   make auxdb        — create AuxDB schemas + seed reference data
-#   make migrate      — create SQL Server schemas, tables, indexes
+#   make setup        — full bootstrap: up → AuxDB schema → SQL Server schema
 #   make seed         — start the GA4 mock seeder HTTP server (:11333)
 #   make seed-stop    — stop the seeder process
-#   make setup        — full bootstrap: up → auxdb → migrate
-#   make verify       — assert row counts and no duplicates in SQL Server
-#   make clean        — truncate stage.* and dbo.ga4_sessions / realtime_sessions
 #   make down         — stop containers (keep volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
-#   make logs         — tail all container logs
-#   make status       — show container health
-#   make watch        — live metrics dashboard (polls until Ctrl+C)
-#                       Override: make watch INTERVAL=10s
-#   make test         — run Go unit tests
-#   make lint         — run golangci-lint
 #
 # SEED OVERRIDES:
 #   make seed ROWS_PER_DAY=5000 SEEDER_PORT=11333
@@ -29,6 +18,7 @@ SHELL := C:/Program Files/Git/bin/bash.exe
 
 # Redirect Go build cache to a local dir so Windows doesn't block execution from %TEMP%
 export GOTMPDIR := $(CURDIR)/tmp
+$(shell mkdir -p $(CURDIR)/tmp)
 
 COMPOSE_FILE   := docker-compose.yml
 
@@ -42,24 +32,15 @@ MSSQL_PASS     ?= Etl_Pass_456!
 AUXDB_DSN      ?= host=localhost port=5446 dbname=auxdb user=etl_user password=etl_pass sslmode=disable
 
 SEEDER_PORT    ?= 11333
-SEEDER_URL     ?= http://localhost:$(SEEDER_PORT)
 ROWS_PER_DAY   ?= 15000
 
-INTERVAL       ?= 5s
-
-.PHONY: up down reset wait-healthy deps auxdb migrate seed seed-stop setup \
-        verify clean logs status watch test lint
+.PHONY: up down reset setup seed seed-stop
 
 ## Start SQL Server + AuxDB containers
 up:
 	@echo ">>> Starting Docker containers..."
 	docker compose -f $(COMPOSE_FILE) up -d
 	@echo ">>> Waiting for all services to be healthy..."
-	$(MAKE) wait-healthy
-
-## Wait until both containers report healthy
-wait-healthy:
-	@echo "  Checking health..."
 	@for svc in analytics_sqlserver auxdb; do \
 		printf "  Waiting for $$svc "; \
 		for i in $$(seq 1 40); do \
@@ -79,22 +60,14 @@ reset:
 	docker compose -f $(COMPOSE_FILE) down -v
 	@echo ">>> Volumes destroyed"
 
-## Download Go module dependencies
-deps:
+## Full bootstrap: start containers → AuxDB schema → SQL Server schema
+setup: up
 	@echo ">>> Downloading Go dependencies..."
 	go mod download
 	go mod tidy
-	@echo ">>> Dependencies ready"
-
-## Create AuxDB schema + seed reference data
-auxdb:
 	@echo ">>> Setting up AuxDB..."
-	go run ./cmd/auxdb_setup \
-		-dsn "$(AUXDB_DSN)"
-	@echo ">>> AuxDB ready"
-
-## Create SQL Server database, schemas, tables, indexes
-migrate:
+	go build -o $(GOTMPDIR)/auxdb_init$(GOEXE) ./cmd/auxdb_setup
+	$(GOTMPDIR)/auxdb_init$(GOEXE) -dsn "$(AUXDB_DSN)"
 	@echo ">>> Applying SQL Server schema..."
 	go run ./cmd/mssql_schema \
 		-host $(MSSQL_HOST) \
@@ -103,7 +76,7 @@ migrate:
 		-db $(MSSQL_DB) \
 		-user $(MSSQL_USER) \
 		-pass "$(MSSQL_PASS)"
-	@echo ">>> SQL Server schema ready"
+	@echo ">>> Setup complete. Run 'make seed' to start the GA4 mock server."
 
 ## Start GA4 mock seeder HTTP server in the background
 seed:
@@ -123,65 +96,3 @@ seed-stop:
 	else \
 		echo ">>> No seeder PID file found"; \
 	fi
-
-## Full bootstrap: start containers → auxdb → migrate
-setup: up auxdb migrate
-	@echo ">>> Setup complete. Run 'make seed' to start the GA4 mock server."
-
-## Assert row counts and no duplicates
-verify:
-	@echo ">>> Running verification queries..."
-	/opt/mssql-tools18/bin/sqlcmd -S $(MSSQL_HOST),$(MSSQL_PORT) \
-		-U $(MSSQL_USER) -P "$(MSSQL_PASS)" -C \
-		-d $(MSSQL_DB) -Q "\
-		SELECT 'ga4_sessions'    AS tbl, COUNT(*) AS rows FROM dbo.ga4_sessions; \
-		SELECT 'realtime'        AS tbl, COUNT(*) AS rows FROM dbo.realtime_sessions; \
-		SELECT 'pipeline_log'    AS tbl, COUNT(*) AS rows FROM dbo.pipeline_run_log; \
-		SELECT property_id, surface, COUNT(*) AS rows, MIN(report_date) AS min_date, MAX(report_date) AS max_date \
-		FROM dbo.ga4_sessions GROUP BY property_id, surface ORDER BY property_id; \
-		SELECT COUNT(*) AS dup_count FROM ( \
-		  SELECT property_id, report_date, session_id, COUNT(*) AS n \
-		  FROM dbo.ga4_sessions GROUP BY property_id, report_date, session_id HAVING COUNT(*) > 1 \
-		) d;"
-	@echo ">>> Verification complete"
-
-## Truncate staging and production tables for a clean re-run
-clean:
-	@echo ">>> Truncating tables..."
-	/opt/mssql-tools18/bin/sqlcmd -S $(MSSQL_HOST),$(MSSQL_PORT) \
-		-U $(MSSQL_USER) -P "$(MSSQL_PASS)" -C \
-		-d $(MSSQL_DB) -Q "\
-		TRUNCATE TABLE stage.ga4_sessions; \
-		DELETE FROM dbo.ga4_sessions; \
-		DELETE FROM dbo.realtime_sessions; \
-		DELETE FROM dbo.pipeline_run_log;"
-	@echo ">>> Tables cleared"
-
-## Tail container logs
-logs:
-	docker compose -f $(COMPOSE_FILE) logs -f
-
-## Show container health
-status:
-	@docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' \
-		--filter name=analytics_sqlserver \
-		--filter name=auxdb
-
-## Live metrics dashboard (polls SQL Server + AuxDB until Ctrl+C)
-watch:
-	MSSQL_HOST=$(MSSQL_HOST) MSSQL_PORT=$(MSSQL_PORT) MSSQL_DB=$(MSSQL_DB) \
-	MSSQL_USER=$(MSSQL_USER) MSSQL_PASS="$(MSSQL_PASS)" \
-	AUXDB_DSN="$(AUXDB_DSN)" \
-	go run ./cmd/metrics_watcher --interval $(INTERVAL)
-
-## Run Go unit tests
-test:
-	@echo ">>> Running tests..."
-	go test ./... -v -count=1
-	@echo ">>> Tests done"
-
-## Run golangci-lint
-lint:
-	@echo ">>> Running linter..."
-	golangci-lint run ./...
-	@echo ">>> Lint done"
