@@ -389,52 +389,52 @@ Records routed here by:
 
 ---
 
-## Part 6 — ICursorRESTAPISource Implementation
+## Part 6 — IClientRESTAPISource Implementation
 
-The Go connector package implements `coreinterface.IClientRESTAPISource` in cursor mode for the Zepto Order Events API.
+The Go connector package implements `coreinterface.IClientRESTAPISource` in cursor mode for the Zepto Order Events API. That interface has exactly four methods — `GeneratePaginateRequest`, `GenerateWebhookRequest`, `GenerateCursorRequest`, `FetchRecords` — there is no separate cursor-advancement method. Response parsing and cursor forwarding are both **func fields set on the `*models.RESTAPISourceCursorTune`** that `GenerateCursorRequest` returns, not additional interface methods.
 
 ### 6.1 Interface Method Mapping
 
 | Interface Method | Zepto Usage |
 |---|---|
-| `GenerateCursorRequest` | Constructs `GET /api/v2/order-events?cursor=<cursor>&limit=500` with `X-Internal-Token` header |
-| `FetchRecords` | Parses the JSON response body; extracts the `events` array; returns `[]map[string]any` |
-| `NextCursor` | Reads `next_cursor` and `has_more` from the response body; returns `("", false)` when `has_more = false` |
+| `GenerateCursorRequest` | Called once at flow start. Builds the request config (`Path`, `CursorParam`, starting `CursorValue` resumed from `zepto_ingestion_cursors`) **and** sets two closures on the returned tune: `ParseFn` (parses each page's JSON body into records) and `NextPageToken` (extracts the next cursor value, or signals exhaustion). The engine drives every subsequent page itself using those two closures — it does not call `GenerateCursorRequest` again per page. |
+| `FetchRecords` | Not used — Zepto uses cursor capture mode (`ReadByCursor`), not `ReadByUserDefinedFunc`. Stubbed (see STEP-14). |
 | `GeneratePaginateRequest` | Not used — Zepto API is cursor-based, not offset-based |
 | `GenerateWebhookRequest` | Not used — Zepto API has no push mechanism |
-| `StreamRecords` | Not used — Flow 1 polls on demand |
 
 ### 6.2 `GenerateCursorRequest` — Parameter Mapping
 
 ```
 Input (models.RESTAPISourceFetch):
-  Cursor   string  -- "" on first call; "seq_500", "seq_1000", ... on subsequent pages
+  State, SourceDBConn (*http.Client — X-Internal-Token already installed at Connect() time),
+  AuxiliaryDBConnMap (includes the AuxDB connection, used to read the resume cursor)
+  -- no per-call Cursor field: GenerateCursorRequest is invoked once per flow start, not once per page.
 
-Output (RESTAPICursorTune):
-  Path     = "/api/v2/order-events"
-  Method   = "GET"
-  Headers  = {"X-Internal-Token": "<token>"}
-  Params   = {"cursor": Cursor, "limit": "500"}
-  RecordsPath = "events"  -- dot-path into response JSON
+Output (*models.RESTAPISourceCursorTune):
+  Path        = "/api/v2/order-events?limit=500"
+  CursorParam = "cursor"
+  CursorValue = <last_cursor read from zepto_ingestion_cursors; "" on first run>
+  ParseFn       = func(resp models.RESTAPIRawResponse) ([]map[string]any, error) { ... }   // see §6.3
+  NextPageToken = func(body []byte, headers http.Header) (string, bool) { ... }             // see §6.4
 ```
 
-### 6.3 `FetchRecords` — Response Parsing
+`RESTAPISourceCursorTune` has no `Headers` field — the `X-Internal-Token` header is applied once on the shared `*http.Client` during `Connect()`, not per-request via the tune.
 
-The response body carries a top-level `events` array. `FetchRecords` unmarshals the JSON and returns the array as `[]map[string]any`. Each map key maps directly to the field names in §1.3.
+### 6.3 `ParseFn` — Response Parsing
 
-The connector also extracts `next_cursor` and `has_more` from the response body and stores them in connector state for `NextCursor` to consume.
+The response body carries a top-level `events` array. The `ParseFn` closure set on the tune unmarshals the JSON and returns the array as `[]map[string]any`. Each map key maps directly to the field names in §1.3. The engine invokes `ParseFn` itself after every page fetch — the connector never manually loops over pages outside of `ParseFn`/`NextPageToken`.
 
-### 6.4 `NextCursor` — Cursor Forwarding
+### 6.4 `NextPageToken` — Cursor Forwarding
 
 ```
-NextCursor(body, headers):
-  read next_cursor and has_more from connector state (set by FetchRecords)
+NextPageToken(body, headers):
+  parse next_cursor and has_more from the same response body ParseFn received
   if has_more == false:
     return ("", false)
   return (next_cursor, true)
 ```
 
-The engine passes the returned cursor string back into `GenerateCursorRequest` as `Cursor` on the next iteration. The engine stops calling `GenerateCursorRequest` when `NextCursor` returns `false`.
+The engine calls `NextPageToken` once per page (inside its own pagination loop, not inside `GenerateCursorRequest`) and uses the returned string as the `cursor` value for the next request. The engine stops issuing further pages the moment `NextPageToken` returns `false`.
 
 ---
 
@@ -471,9 +471,9 @@ Collection  = Zepto Order Events Pipeline
 | Connector | System | Interface | Used by |
 |---|---|---|---|
 | `connector_zepto_api` | Zepto REST API | `IClientRESTAPISource` (cursor mode) | Flow 1 source |
-| `connector_kafka_producer` | Kafka `zepto.order.events` | `IClientKafkaDestination` | Flow 1 destination |
-| `connector_kafka_consumer` | Kafka `zepto.order.events` | `IClientKafkaSource` | Flow 2 source |
-| `connector_cassandra` | Cassandra `zepto_events` | `IClientCassandraDestination` | Flow 2 destination |
+| `connector_kafka_producer` | Kafka `zepto.order.events` | `IClientDBKafkaDest` | Flow 1 destination |
+| `connector_kafka_consumer` | Kafka `zepto.order.events` | `IClientDBKafkaSource` | Flow 2 source |
+| `connector_cassandra` | Cassandra `zepto_events` | `IClientDBCassandraDest` | Flow 2 destination |
 
 ### 7.3 Concurrency Model
 
@@ -605,28 +605,27 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 
 ### Phase 3 — Zepto API Source Connector
 
-- [ ] **STEP-10** — Scaffold the cursor REST API connector package. Define its state struct: `baseURL string`, `token string`, `nextCursorVal string`, `hasMoreVal bool`. Set `hasMoreVal = true` on initialisation so the first call fires.
-- [ ] **STEP-11** — Implement `GenerateCursorRequest` — constructs `GET <baseURL>/api/v2/order-events?cursor=<Cursor>&limit=500`. Sets `X-Internal-Token` header from config. Sets `RecordsPath = "events"` so the engine knows which JSON key contains the records array.
-- [ ] **STEP-12** — Implement `FetchRecords` — unmarshals the response JSON body into `map[string]any`. Extracts the `events` array as `[]map[string]any`. Reads `next_cursor` and `has_more` from the response root and stores them in connector state for `NextCursor` to consume.
-- [ ] **STEP-13** — Implement `NextCursor` — reads `hasMoreVal` and `nextCursorVal` from connector state. Returns `("", false)` when `hasMoreVal` is `false`. Returns `(nextCursorVal, true)` otherwise. The engine stops pagination when this method returns `false`.
-- [ ] **STEP-14** — Stub `GeneratePaginateRequest`, `GenerateWebhookRequest`, and `StreamRecords` with panics: `"Zepto connector: offset pagination not supported"`, `"Zepto connector: webhook mode not supported"`, `"Zepto connector: streaming mode not supported"`. Prevents silent use of unimplemented paths.
+- [ ] **STEP-10** — Scaffold the cursor REST API connector package implementing `coreinterface.IClientRESTAPISource`. No connector-instance cursor state is needed: the cursor position is threaded through `models.RESTAPISourceCursorTune.CursorValue` (read fresh from AuxDB on each `GenerateCursorRequest` call) and advanced entirely by the `NextPageToken` closure the tune carries. The `X-Internal-Token` header is installed once on the shared `*http.Client` at `Connect()` time, not per request.
+- [ ] **STEP-11** — Implement `GenerateCursorRequest(param *models.RESTAPISourceFetch) (*models.RESTAPISourceCursorTune, error)` — reads `last_cursor` from `zepto_ingestion_cursors` via `param.AuxiliaryDBConnMap` (empty string on first run) and returns `&models.RESTAPISourceCursorTune{Path: "/api/v2/order-events?limit=500", CursorParam: "cursor", CursorValue: <resumed cursor>, ParseFn: ..., NextPageToken: ...}`. Called once at flow start, not once per page.
+- [ ] **STEP-12** — Implement the tune's `ParseFn func(models.RESTAPIRawResponse) ([]map[string]any, error)` closure — unmarshals the JSON response body, extracts the top-level `events` array, and returns it as `[]map[string]any`. Each map key maps directly to the field names in §1.3. The engine invokes this closure once per fetched page.
+- [ ] **STEP-13** — Implement the tune's `NextPageToken func(body []byte, headers http.Header) (string, bool)` closure — parses `next_cursor` and `has_more` from the same response body `ParseFn` received. Returns `("", false)` when `has_more` is `false`; otherwise returns `(next_cursor, true)`. The engine stops issuing further pages the moment this closure returns `false`.
+- [ ] **STEP-14** — Stub the three other `IClientRESTAPISource` methods with panics: `GeneratePaginateRequest` → `"Zepto connector: offset pagination not supported"`, `GenerateWebhookRequest` → `"Zepto connector: webhook mode not supported"`, `FetchRecords` → `"Zepto connector: user-defined fetch mode not supported"`. Prevents silent use of unimplemented capture modes. (There is no `StreamRecords` method on this interface to stub.)
 
 ### Phase 4 — Kafka Connector
 
-- [ ] **STEP-15** — Implement `connector_kafka_producer` — wraps the Go Kafka client to publish `map[string]any` records to `zepto.order.events`. Partition key: SHA-256 of `city + store_id` modulo partition count, ensuring all events for a store go to the same partition. JSON-serialises each record before publishing. Returns an error on publish timeout or broker unavailability for the engine to route to `zepto_ingestion_backlog`.
-- [ ] **STEP-16** — Implement `connector_kafka_consumer` — opens a Kafka consumer on `zepto.order.events` with 3 partitions. On startup, reads per-partition offsets from `zepto_storage_offsets` in AuxDB and seeks each partition to `last_offset + 1`. If no checkpoint exists, starts from the earliest available offset. Returns records as `map[string]any` with injected metadata fields: `_kafka_topic`, `_kafka_partition`, `_kafka_offset`.
+- [ ] **STEP-15** — Implement `connector_kafka_producer` implementing `IClientDBKafkaDest`. `GenerateQuery(param *models.KafkaDestQuery) ([]*models.KafkaDestQueryTune, error)` builds one `*models.KafkaDestQueryTune{Topic: "zepto.order.events", Key, Value, Partition, Headers}` per record from `param.Records`: `Key` is derived from SHA-256 of `city + store_id` modulo 3 (as an explicit `Partition` index) so all events for a store land in the same partition; `Value` is the JSON-serialised record. The engine executes the returned tunes against the Kafka producer — the connector never calls the Sarama client directly. Errors surfaced from execution (publish timeout, broker unavailability) are what the engine routes to `zepto_ingestion_backlog`.
+- [ ] **STEP-16** — Implement `connector_kafka_consumer` implementing `IClientDBKafkaSource`. `GenerateAssignment(param *models.KafkaSourceAssign) (*models.KafkaSourceAssignmentTune, error)` reads per-partition offsets from `zepto_storage_offsets` in AuxDB (via `param.AuxiliaryDBConnMap`) and returns `Partitions: []models.KafkaTopicPartition{{Topic: "zepto.order.events", Partition: p, Offset: last_offset+1}, ...}` for each of the 3 partitions — falling back to the earliest available offset per partition when no checkpoint row exists. Offset and partition for each consumed message are available on `models.KafkaRawMessage.Offset`/`.Partition`, which the engine attaches to the delivered record by default; the connector does not need to inject custom `_kafka_*` metadata fields itself.
 
 ### Phase 5 — Cassandra Destination Connector
 
-- [ ] **STEP-17** — Implement `connector_cassandra` — opens a `gocql.Session` to the Cassandra cluster. Exposes `WriteOrderEvent(record map[string]any) error` which executes:
+- [ ] **STEP-17** — Implement `connector_cassandra` implementing `IClientDBCassandraDest`. `GenerateQuery(param *models.CassandraDestQuery) ([]*models.CassandraDestQueryTune, error)` builds one `*models.CassandraDestQueryTune` per record with:
   ```cql
-  INSERT INTO zepto_events.order_events
-    (city, store_id, event_type, created_at, event_id, order_id, customer_id, status, amount, payload, run_id)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  USING TTL 7776000
+  CQL:  INSERT INTO zepto_events.order_events
+          (city, store_id, event_type, created_at, event_id, order_id, customer_id, status, amount, payload, run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ```
-  Returns `gocql` errors directly so the engine can route to `zepto_storage_backlog`. TTL is hardcoded to `7776000` seconds (90 days).
-- [ ] **STEP-18** — Add `WriteBatch(records []map[string]any) error` to the Cassandra connector using `gocql` `UnloggedBatch` for throughput. Batch size: 50 records (avoids Cassandra's default 50KB batch warning threshold). On partial batch failure, falls back to single-row inserts so successful records land in Cassandra and only the failing rows go to the backlog.
+  `Parameters: []any{...}` bound in column order, `Operation: models.CassandraDestOpInsert`, `TTL: 7776000` (90 days). The engine executes the returned tune(s) against the `gocql.Session`; the connector itself never calls `Session.Query`. `gocql` errors surfaced from execution are what the engine routes to `zepto_storage_backlog`.
+- [ ] **STEP-18** — For batch writes, set `Operation: models.CassandraDestOpBatch` and populate `BatchStatements []*models.CassandraDestQueryTune` (one entry per record, up to 50 per batch — avoids Cassandra's default 50KB batch warning threshold) with `Logged: false` for an UNLOGGED batch. On partial batch failure, `GenerateQuery` falls back to returning individual single-statement tunes (`Operation: models.CassandraDestOpInsert`) so successful records land in Cassandra and only the failing rows surface as errors for the backlog.
 
 ### Phase 6 — Transformer Chains
 
@@ -645,14 +644,15 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 - [ ] **STEP-25** — Implement Flow 1 cursor checkpoint: after each successfully published page, upsert `zepto_ingestion_cursors` with `pipeline = <name>`, `last_cursor = <response.next_cursor>`, `updated_at = now()`. Use `INSERT ... ON CONFLICT (pipeline) DO UPDATE` (upsert). On startup, query `last_cursor` from this table before making the first API call.
 - [ ] **STEP-26** — Implement Flow 2 offset checkpoint: after each batch of Cassandra writes, upsert `zepto_storage_offsets` for each `(topic, partition)` with the highest committed offset in that batch. On startup, query all rows from this table and seek each Kafka partition to `last_offset + 1`.
 - [ ] **STEP-27** — Implement Flow 1 ingestion backlog writer: on any transformer or destination error in Flow 1, insert into `zepto_ingestion_backlog` with `order_id`, `event_id`, `failure_stage` (transform/destination), `error_message`, `record_payload` (JSONB-serialised record), `pipeline_run_id`.
-- [ ] **STEP-28** — Implement Flow 2 storage backlog writer: on any transformer or destination error in Flow 2, insert into `zepto_storage_backlog` with the same fields as the ingestion backlog plus `kafka_topic`, `kafka_partition`, `kafka_offset` extracted from the `_kafka_*` metadata fields injected by the Kafka consumer connector.
-- [ ] **STEP-29** — Implement `TerminateRule` evaluation for both flows. Rules:
-  - `ERROR_RATE_BREACH` — backlog rate > 10% of records in the current batch → stop
-  - `SOURCE_UNREACHABLE` — HTTP 5xx from API after 3 retries (Flow 1) or Kafka consumer error after 3 retries (Flow 2) → stop
-  - `DESTINATION_UNREACHABLE` — Kafka broker unavailable after 3 retries (Flow 1) or Cassandra pool empty after 3 retries (Flow 2) → stop
-  - `CURSOR_EXHAUSTED` — `has_more = false` and final page processed → clean stop for Flow 1
-  - `IDLE_TIMEOUT` — no records consumed for 30 seconds → stop for Flow 2
-  - `MANUAL_KILL` — `FORCE_STOP=true` environment variable set → graceful stop at next checkpoint
+- [ ] **STEP-28** — Implement Flow 2 storage backlog writer: on any transformer or destination error in Flow 2, insert into `zepto_storage_backlog` with the same fields as the ingestion backlog plus `kafka_topic`, `kafka_partition`, `kafka_offset` extracted from the Kafka offset/partition metadata the engine attaches to each record by default (from `models.KafkaRawMessage.Offset`/`.Partition`), not custom `_kafka_*` map keys injected by the connector.
+- [ ] **STEP-29** — Implement `TerminateRule` evaluation for both flows. Only three termination rules are framework-native (`models.TerminateRuleTune{MaxRecords, IdleTimeout, MaxPipelineTime}`, emitting rule names `MAX_RECORDS`, `IDLE_TIMEOUT`, `MAX_PIPELINE_TIME`); everything else must be hand-rolled via `TerminateRuleTune.UserDefinedCheckFunc func(*models.CustomTerminateRuleCheckProps) (*models.TerminateRuleActionTune, error)`:
+  - `IDLE_TIMEOUT` (built-in) — no records consumed for 30 seconds → stop for Flow 2
+  - `MAX_PIPELINE_TIME` (built-in) — optional wall-clock ceiling per flow, if configured
+  - `CURSOR_EXHAUSTED` (hand-rolled via `UserDefinedCheckFunc`) — `has_more = false` and final page processed → clean stop for Flow 1
+  - `ERROR_RATE_BREACH` (hand-rolled) — backlog rate > 10% of records in the current batch → stop
+  - `SOURCE_UNREACHABLE` (hand-rolled) — HTTP 5xx from API after 3 retries (Flow 1) or Kafka consumer error after 3 retries (Flow 2) → stop
+  - `DESTINATION_UNREACHABLE` (hand-rolled) — Kafka broker unavailable after 3 retries (Flow 1) or Cassandra pool empty after 3 retries (Flow 2) → stop
+  - `MANUAL_KILL` (hand-rolled) — `FORCE_STOP=true` environment variable set → graceful stop at next checkpoint, returned from `UserDefinedCheckFunc`
 
 ### Phase 8 — Observability
 

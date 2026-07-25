@@ -208,7 +208,7 @@ Records that cannot be processed are routed to AuxDB `backlog_records` instead o
 **Backlog record metadata:**
 
 - `sub_brand`, `city`, `entity`, `table_split_index`, `flow_type`
-- `batch_id`, `failure_stage` — Transform / Destination / WALUnwrap
+- `batch_id`, `failure_stage` — `Transform` / `Destination` (the framework's `FailureStage` enum has only these two non-zero values; `WALEventUnwrapper` failures are tagged `Transform` since it is itself a transformer, not a distinct WAL stage)
 - `error_code`, `error_message`
 - `raw_record` — full original record JSON (pre-transform, for replay)
 - `retry_count`, `status` — PENDING / IN_RETRY / RESOLVED / ABANDONED
@@ -217,6 +217,8 @@ Records that cannot be processed are routed to AuxDB `backlog_records` instead o
 ### 2.4 TerminateRule
 
 Evaluated on a configurable tick interval. Thresholds stored in AuxDB `terminate_rules`.
+
+The framework itself only ships three built-in terminate rules — `MAX_RECORDS`, `IDLE_TIMEOUT`, `MAX_PIPELINE_TIME` (`TerminateRuleTune.MaxRecords`/`IdleTimeout`/`MaxPipelineTime`). Everything below (including this case's `IDLE_TIMEOUT`-named row, which reimplements the same idea against AuxDB-driven thresholds) is a hand-rolled check wired through `TerminateRuleTune.UserDefinedCheckFunc`, not a framework-native rule name.
 
 | Rule | Condition | Action |
 |---|---|---|
@@ -461,9 +463,9 @@ Collection  = Zomato Platform Order Intelligence Job
 | connector_2 | `blinkit_db` | Postgres source | Cold flow + Stage 1 WAL | `IClientDBPostgresSource` |
 | connector_3 | `hyperpure_db` | Postgres source | Cold flow + Stage 1 WAL | `IClientDBPostgresSource` |
 | connector_4 | `district_db` | Postgres source | Cold flow + Stage 1 WAL | `IClientDBPostgresSource` |
-| connector_5 | Elasticsearch | Destination | Cold flow + Stage 2 | `IClientElasticsearchDestination` |
-| connector_6 | Redis | Destination | Stage 1 WAL Ingestion | `IClientRedisStreamDestination` |
-| connector_7 | Redis | Source | Stage 2 Stream Indexing | `IClientRedisStreamSource` |
+| connector_5 | Elasticsearch | Destination | Cold flow + Stage 2 | `IClientDBElasticDest` |
+| connector_6 | Redis | Destination | Stage 1 WAL Ingestion | `IClientDBRedisDest` |
+| connector_7 | Redis | Source | Stage 2 Stream Indexing | `IClientDBRedisSource` |
 
 **Cold flow iso-entities (connector_1 example — zomato_food):**
 
@@ -551,9 +553,9 @@ Stage 1 and Stage 2 run in separate processes. If Elasticsearch slows and `Desti
 
 ### Phase 3 — Cold Flow Connectors
 
-- [ ] **STEP-11** — Implement source connectors for cold flow: `connector_1` through `connector_4` — one per brand. Each connector implements `IClientDBPostgresSource` with `GenerateQuery()` that reads `table` from `ReplicaProps` (set by `orchestrator_1`) and returns `SELECT * FROM {table} WHERE order_id > {last_pk} ORDER BY order_id` for resumable extraction. `GenerateBinLog()` panics (not used in cold flow).
+- [ ] **STEP-11** — Implement source connectors for cold flow: `connector_1` through `connector_4` — one per brand. Each connector implements `IClientDBPostgresSource` with `GenerateQuery()` that reads `table` from `ReplicaProps` (set by `orchestrator_1`) and returns `SELECT * FROM {table} WHERE order_id > {last_pk} ORDER BY order_id` for resumable extraction. `GenerateWAL()` and `GenerateNotification()` are unimplemented/unused in cold flow — the interface has no `GenerateBinLog` method (that's a MySQL/Maria binlog concept, not Postgres).
 - [ ] **STEP-12** — Implement cold flow source iso-entities (`iso_entity_1` through `iso_entity_16`) — 4 entities × 4 brands = 16 packages. Each is a thin stub that satisfies the connector interface for its specific table and brand. The `GenerateQuery()` method is inherited from the connector; the iso-entity provides the `entityBaseName` (e.g., `orders`) for orchestrator table discovery.
-- [ ] **STEP-13** — Implement destination connector for Elasticsearch: `connector_5` with iso-entities `iso_entity_33` (cold) and `iso_entity_34` (hot). Uses Elasticsearch `_bulk` API. Document ID constructed as `{sub_brand}_{order_id}`. Implements `BulkIndex()` and `FlushBuffer()` methods.
+- [ ] **STEP-13** — Implement destination connector for Elasticsearch: `connector_5` with iso-entities `iso_entity_33` (cold) and `iso_entity_34` (hot). Uses Elasticsearch `_bulk` API. Document ID constructed as `{sub_brand}_{order_id}`. Implements `IClientDBElasticDest.GenerateQuery()`, returning one `models.ElasticDestQueryTune{Index, DocID, Document, Operation: ElasticWriteIndex, RefreshPolicy}` per record — the engine performs the actual bulk write from the returned tunes; there are no client-side `BulkIndex()`/`FlushBuffer()` methods.
 
 ### Phase 4 — Hot Flow Connectors
 
@@ -575,14 +577,14 @@ Stage 1 and Stage 2 run in separate processes. If Elasticsearch slows and `Desti
 - [ ] **STEP-23** — Implement `transformer_11` (`OrderValueBander`) — buckets `total_amount` into `order_value_band`: `<100` → "0–100", `100–500` → "100–500", `500–2000` → "500–2000", `>=2000` → "2000+". Sets `order_value_band = na` for District (event ticket pricing is in `ticket_count × face_value` which is surfaced separately).
 - [ ] **STEP-24** — Implement `transformer_12` (`CancellationStageClassifier`) — only activates if `canonical_status = cancelled`. Determines stage from `order_status_events` history embedded in record (or looked up from AuxDB if not embedded): `pre_accept`, `post_accept`, `post_pickup` for food brands; `pre_event`, `post_event` for District.
 - [ ] **STEP-25** — Implement `transformer_13` (`TypeCaster_PGtoElastic`) — converts Postgres output types to Elasticsearch-compatible Go types: `time.Time` → ISO8601 string, `pgtype.Numeric` → `float64`, `[]byte` → base64 string, `nil` → omitted field.
-- [ ] **STEP-26** — Implement `transformer_14` (`WALEventUnwrapper`) — hot flow only. Parses the Redis stream message JSON, extracts `op` (INSERT/UPDATE/DELETE), `table`, and `after` (the new row). For DELETE events, constructs a tombstone record and routes to backlog with `failure_stage = WALDelete` (Elasticsearch does not support soft-delete via upsert without explicit handling). Returns the `after` record for downstream transformers.
+- [ ] **STEP-26** — Implement `transformer_14` (`WALEventUnwrapper`) — hot flow only. Parses the Redis stream message JSON, extracts `op` (INSERT/UPDATE/DELETE), `table`, and `after` (the new row). For DELETE events, constructs a tombstone record and routes to backlog with `failure_stage = FailureStageTransform` (the framework's `FailureStage` enum only defines `None`/`Transform`/`Destination` — there is no distinct WAL-delete stage, so this is tagged as a transform-stage backlog entry) since Elasticsearch does not support soft-delete via upsert without explicit handling. Returns the `after` record for downstream transformers.
 - [ ] **STEP-27** — Wire transformer chains in all 32 pipeline bridge files. Cold bridges: transformers 1 → 2/3/4/5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13. Hot bridges: 14 → then same chain.
 
 ### Phase 6 — Pipeline Control Plane
 
 - [ ] **STEP-28** — Implement `checkpoint_1` — writes state to AuxDB `pipeline_checkpoints` with the extended schema (§2.2). Cold flow records `last_processed_pk`; hot flow records `redis_stream_id` and `wal_lsn`. Resume logic: cold connectors query `last_processed_pk` before first SELECT; hot connectors query `redis_stream_id` before first `XREADGROUP`.
 - [ ] **STEP-29** — Implement `backlog_1` — writes failed records to AuxDB `backlog_records`. Extended schema includes `flow_type` (cold/hot) and `redis_stream_id` (for hot flow replay). Always returns `ActionContinue` unless AuxDB connection itself fails. Also writes to `es_write_log` on Elasticsearch bulk-index partial failures (some docs in a batch rejected).
-- [ ] **STEP-30** — Implement `terminate_1` — extends Case 1's 8 rules with 2 new hot-flow rules: `REDIS_STREAM_LAG` (consumer group lag check via `XINFO GROUPS`) and `WAL_SLOT_INACTIVE` (checks `pg_replication_slots` view for `active = false`). All 9 rules read thresholds from AuxDB `terminate_rules` on each tick.
+- [ ] **STEP-30** — Implement `terminate_1` — extends Case 1's 8 rules with 2 new hot-flow rules: `REDIS_STREAM_LAG` (consumer group lag check via `XINFO GROUPS`) and `WAL_SLOT_INACTIVE` (checks `pg_replication_slots` view for `active = false`). All 9 rules are hand-rolled checks wired through `TerminateRuleTune.UserDefinedCheckFunc` (the framework's only built-ins are `MAX_RECORDS`/`IDLE_TIMEOUT`/`MAX_PIPELINE_TIME`) and read thresholds from AuxDB `terminate_rules` on each tick.
 - [ ] **STEP-31** — Implement `destinationwrite_1` — extends Case 1's speedify/slowify with Elasticsearch-specific tuning: controls `refresh_interval` via Elasticsearch Index Settings API (set to `-1` in speedify, `30s` in slowify). Also throttles Redis `XREADGROUP COUNT` for hot flow during slowify.
 
 ### Phase 7 — Backfill Completion Handoff

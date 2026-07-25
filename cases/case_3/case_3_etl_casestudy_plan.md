@@ -115,7 +115,7 @@ GA4 `runReport` uses **offset-based pagination**, not cursor-based. The engine m
 3. Calculate pages: `ceil(rowCount / 100000)`
 4. Issue subsequent requests with `offset: 100000, 200000, ...` up to `rowCount`
 
-There is **no `nextPageToken`** in the GA4 response body for `runReport`. The `NextPageToken` method on `IClientRESTAPISource` is adapted here to encode the next offset as a string (`"100000"`, `"200000"`, etc.) and returns `false` when `offset >= rowCount`.
+There is **no `nextPageToken`** in the GA4 response body for `runReport`. The `NextPageToken` func field on `RESTAPISourcePaginateTune` (set when `GeneratePaginateRequest` builds the tune — see §4.2) is adapted here to encode the next offset as a string (`"100000"`, `"200000"`, etc.) and returns `false` when `offset >= rowCount`.
 
 ---
 
@@ -247,7 +247,7 @@ The `WHEN NOT MATCHED BY SOURCE` clause is intentionally **omitted** — the pip
 **Execution model**:
 1. The driver generates a list of 730 individual date strings (`2024-01-01` … `2025-12-31`).
 2. For each date, the pipeline calls `IClientRESTAPISource.GeneratePaginateRequest` with the date window and requested dimensions/metrics.
-3. The engine calls `FetchRecords` per page and aggregates all rows for that date.
+3. The engine calls the tune's `ParseFn` (set by `GeneratePaginateRequest`, see §4.2) per page and aggregates all rows for that date; page advancement is driven by the same tune's `NextPageToken` closure.
 4. After all pages for the date are collected, records are written to `stage.ga4_sessions`.
 5. `MERGE` is executed.
 6. The date is checkpointed in `dbo.pipeline_run_log` so a restart skips completed dates.
@@ -277,9 +277,10 @@ The `WHEN NOT MATCHED BY SOURCE` clause is intentionally **omitted** — the pip
 **Trigger**: Runs every 60 seconds via the Streamcraft scheduler.
 
 **Execution model**:
-1. Calls `IClientRESTAPISource.StreamRecords` which internally calls `runRealtimeReport` for all three properties concurrently (using goroutines).
-2. Records flow into the SQL Server writer as a streaming INSERT (no staging table, no `MERGE` — `realtime_sessions` is append-only with TTL cleanup).
-3. After insert, issues `DELETE FROM dbo.realtime_sessions WHERE snapshot_at < DATEADD(HOUR, -2, GETUTCDATE())` to trim stale rows.
+1. The pipeline job itself carries a recurring execution schedule (`ExecutionConfigJSON.RecurringInfo`, an `ExecutionModeRecurringInfoImpl` — see §4.4) so the Streamcraft scheduler re-invokes the whole Realtime Pulse pipeline roughly every 60 seconds; there is no in-connector ticker or `StreamRecords` method.
+2. Each invocation calls `GeneratePaginateRequest`/`ReadByPagination` against `runRealtimeReport` for all three properties. Since the endpoint returns at most 10,000 unpaginated rows, `NextPageToken` always reports `("", false)` after the first call.
+3. Records flow into the SQL Server writer as a streaming INSERT (no staging table, no `MERGE` — `realtime_sessions` is append-only with TTL cleanup).
+4. After insert, issues `DELETE FROM dbo.realtime_sessions WHERE snapshot_at < DATEADD(HOUR, -2, GETUTCDATE())` to trim stale rows.
 
 **Volume**: ~300 rows per property per snapshot. At 60-second cadence, this produces ~1,500 rows/minute across all three properties — trivial for SQL Server but must stay within the 10,000 realtime tokens/day/property budget (1,440 calls/day per property × 1 token/call = 1,440 tokens — well within budget).
 
@@ -293,40 +294,43 @@ The Go connector package is `client_connector_1_iso_entity_1`. It implements `co
 
 | Interface Method | GA4 Usage | Notes |
 |---|---|---|
-| `GeneratePaginateRequest` | `runReport` with `offset`/`limit` | Used by Historical Backfill and Incremental Daily flows |
+| `GeneratePaginateRequest` | `runReport` (Historical Backfill, Incremental Daily) and `runRealtimeReport` (Realtime Pulse) | Returns a `RESTAPISourcePaginateTune` whose `ParseFn` and `NextPageToken` fields do all response parsing and page advancement (see §4.2) — used by all three flows |
 | `GenerateCursorRequest` | Not used for GA4 standard reports | Would be used if GA4 ever adopted cursor tokens |
 | `GenerateWebhookRequest` | Not used | GA4 has no push/webhook mechanism |
-| `FetchRecords` | Parses `runReport` JSON response body | Extracts `rows[]`, maps dimension/metric headers to key-value maps |
-| `NextPageToken` | Encodes next offset as string | Returns `"200000"` after first page if `rowCount > 100000`; returns `("", false)` when exhausted |
-| `StreamRecords` | `runRealtimeReport` | Returns a `chan map[string]any` fed by a goroutine calling the Realtime API on a ticker |
+| `FetchRecords` | Not used | Only invoked by the engine for `ReadByUserDefinedFunc` mode; this connector runs exclusively in paginate mode (see §4.3) |
+
+There is no `StreamRecords` method anywhere on `IClientRESTAPISource`. The Realtime Pulse Flow's 60-second cadence is a job-level recurring execution schedule, not an in-connector ticker (see §4.4).
 
 ### 4.2 `GeneratePaginateRequest` — Parameter Mapping
 
 ```
 Input (models.RESTAPISourceFetch):
-  Property    string   -- "properties/123456789"
-  DateFrom    string   -- "2024-06-15"
-  DateTo      string   -- "2024-06-15"  (always same day for 1-day chunks)
-  PageToken   string   -- "" on first page; "100000", "200000", ... on subsequent
+  State, SourceDBConn (*http.Client), AuxiliaryDBConnMap, DestDBConn -- the generic fields
+  every RESTAPISourceFetch carries. GA4-specific parameters (Property, DateFrom, DateTo) are
+  not separate struct fields -- the connector reads them off pipeline `State`, populated
+  per-invocation by the Historical Backfill / Incremental Daily / Realtime Pulse drivers
+  (one pipeline invocation per date-chunk for the first two flows; one invocation per
+  60-second tick for the third, see §4.4).
 
 Output (RESTAPISourcePaginateTune):
-  Path        = "/v1beta/{property}:runReport"
-  Method      = "POST"
-  Headers     = {"Content-Type": "application/json", "Authorization": "Bearer {token}"}
-  Body        = {
-                  "dimensions": [...],
-                  "metrics": [...],
-                  "dateRanges": [{"startDate": DateFrom, "endDate": DateTo}],
-                  "limit": 100000,
-                  "offset": parseInt(PageToken) or 0
-                }
-  RecordsPath = "rows"           -- dot-path into response JSON
-  MaxPages    = 0                -- unlimited; engine stops when NextPageToken returns false
+  Path      = "/v1beta/{property}:runReport"
+  Method    = "POST"
+  Headers   = {"Content-Type": "application/json", "Authorization": "Bearer {token}"}
+  Body      = {
+                "dimensions": [...],
+                "metrics": [...],
+                "dateRanges": [{"startDate": DateFrom, "endDate": DateTo}],
+                "limit": 100000,
+                "offset": 0
+              }
+  MaxPages      = 0        -- unlimited; engine stops once NextPageToken returns false
+  ParseFn       = <see below>
+  NextPageToken = <see below>
 ```
 
-### 4.3 `FetchRecords` — Response Parsing
+There is no `RecordsPath` field on `RESTAPISourcePaginateTune` — response-to-record shaping happens entirely inside the `ParseFn` closure set below.
 
-GA4's response structure is non-trivial: dimension and metric values are not keyed by name in each row — instead, the response carries a `dimensionHeaders[]` and `metricHeaders[]` array, and each row's `dimensionValues[]` and `metricValues[]` are positionally aligned to those headers.
+**`ParseFn` — response parsing.** GA4's response structure is non-trivial: dimension and metric values are not keyed by name in each row — instead, the response carries a `dimensionHeaders[]` and `metricHeaders[]` array, and each row's `dimensionValues[]` and `metricValues[]` are positionally aligned to those headers:
 
 ```json
 {
@@ -342,47 +346,49 @@ GA4's response structure is non-trivial: dimension and metric values are not key
 }
 ```
 
-`FetchRecords` re-assembles each row into `map[string]any` by zipping headers with values:
+`ParseFn func(models.RESTAPIRawResponse) ([]map[string]any, error)` zips headers with values to re-assemble each row into `map[string]any`:
 
 ```
 {"date": "20240615", "sessionId": "abc123", "sessions": 3, ...}
 ```
 
-Metric values with `type: TYPE_FLOAT` are parsed as `float64`; all others as `int64` or left as `string` based on the `metricHeaders[i].type` field.
+Metric values with `type: TYPE_FLOAT` are parsed as `float64`; all others as `int64` or left as `string`, based on the `metricHeaders[i].type` field. `ParseFn` also reads the `X-Quota-Token-Cost` header off `resp.Headers` and stamps it as a `_quota_cost` field on each returned record for the `QuotaThrottle` transformer to consume.
 
-### 4.4 `NextPageToken` — Offset Encoding
+**`NextPageToken` — offset encoding.** `NextPageToken func(body []byte, headers http.Header) (string, bool)` parses `rowCount` directly out of the response `body` on every call (GA4 returns it on every page, so no connector-wide `rowCount` state is needed) and advances a per-request offset counter tracked in a closure captured when `GeneratePaginateRequest` built this tune:
 
 ```
-rowCount extracted from response body and stored in connector state.
-currentOffset tracked per call sequence.
-
 NextPageToken(body, headers):
-  parse rowCount from body
-  nextOffset = currentOffset + 100000
+  rowCount   = parse "rowCount" from body
+  nextOffset = <closure-local offset counter> + 100000
   if nextOffset >= rowCount:
     return ("", false)
-  currentOffset = nextOffset
+  <closure-local offset counter> = nextOffset
   return (strconv.Itoa(nextOffset), true)
 ```
 
-The engine passes the returned string back into `GeneratePaginateRequest` as `PageToken` on the next iteration.
+The engine feeds the returned string back into the tune's `PageToken` for the next page.
 
-### 4.5 `StreamRecords` — Realtime Mode
+### 4.3 `FetchRecords` — Unused for This Pipeline
+
+`FetchRecords(param *models.RESTAPISourceFetch) <-chan *models.Record` on `IClientRESTAPISource` only backs `ReadByUserDefinedFunc` mode. This connector never runs in that mode: both `runReport` (paginated) and `runRealtimeReport` (single-page, §4.4) go through `GeneratePaginateRequest`/`ReadByPagination`, whose `ParseFn` and `NextPageToken` fields (§4.2) do all response parsing and page advancement. `FetchRecords` is therefore stubbed to `panic("FetchRecords not supported: GA4 connector runs in paginate mode only")` and is never invoked by the engine for this pipeline.
+
+### 4.4 Realtime Pulse Flow — Recurring Job Invocation
+
+There is no `StreamRecords` method on `IClientRESTAPISource` (the interface only defines `GeneratePaginateRequest`, `GenerateWebhookRequest`, `GenerateCursorRequest`, `FetchRecords`). Periodic/recurring invocation is a **job-scheduling** concern, not something a connector implements internally.
+
+The Realtime Pulse Flow is instead configured as a recurring pipeline job:
 
 ```
-StreamRecords(param):
-  out := make(chan map[string]any, 1000)
-  go func():
-    ticker := time.NewTicker(60 * time.Second)
-    for range ticker.C:
-      call runRealtimeReport for param.Property
-      parse response rows
-      for each row: out <- row
-    close(out)
-  return out
+JobDefinitionImpl.ExecutionConfigJSON.RecurringInfo = &models.ExecutionModeRecurringInfoImpl{...}
 ```
 
-The channel buffer of 1,000 prevents the producer goroutine from blocking if the SQL Server writer is momentarily slow.
+The Streamcraft scheduler re-invokes the whole Realtime Pulse pipeline on that schedule (~every 60 seconds). Each invocation is an ordinary, single-shot run of the same `GeneratePaginateRequest` → `ReadByPagination` path used by the other two flows, pointed at `runRealtimeReport` instead of `runReport`:
+
+- `Path = "/v1beta/{property}:runRealtimeReport"`; `Body` carries the realtime dimensions/metrics only (no `dateRanges`, and `limit`/`offset` are irrelevant since the endpoint returns up to 10,000 unpaginated rows in one response).
+- `ParseFn` parses the realtime rows into `map[string]any` the same way as `runReport`'s header-zip logic above.
+- `NextPageToken` always returns `("", false)` — there is nothing to paginate.
+- Records flow into the SQL Server writer as a streaming INSERT per invocation (no staging table, no `MERGE` — `realtime_sessions` is append-only with TTL cleanup).
+- After each invocation's insert, the driver issues `DELETE FROM dbo.realtime_sessions WHERE snapshot_at < DATEADD(HOUR, -2, GETUTCDATE())` to trim stale rows.
 
 ---
 
@@ -432,7 +438,7 @@ GA4 quota is the dominant operational risk. The following strategies are impleme
 | **1-day window chunking** | Each `runReport` covers exactly one calendar day — avoids sampling AND minimises token cost per request |
 | **`QuotaThrottle` transformer** | Parses the `X-Quota-Token-Cost` custom response header (injected by connector from GA4's quota feedback) and accumulates spend per property per hour |
 | **80% soft limit** | When hourly tokens reach 32,000 (80% of 40K), the pipeline parks the current property's date queue and sleeps until the hour resets |
-| **Exponential backoff on 429** | `FetchRecords` detects HTTP 429 / `RESOURCE_EXHAUSTED` and backs off with jitter: `base=5s, multiplier=2, cap=300s` |
+| **Exponential backoff on 429** | `ParseFn` (§4.2) inspects the `RESTAPIRawResponse` for HTTP 429 / `RESOURCE_EXHAUSTED` and signals the engine to back off with jitter: `base=5s, multiplier=2, cap=300s` |
 | **Sequential property processing** | The three GA4 properties share one GCP service account; running them in parallel would triple token consumption per hour. Properties run sequentially with a 2-minute gap between them |
 | **Checkpoint + resume** | `dbo.pipeline_run_log` records the last successfully merged date per property. On restart the engine skips already-completed dates |
 
@@ -485,14 +491,12 @@ seeder/
 ## Part 9 — Makefile Targets
 
 ```makefile
-make up           # Start seeder + SQL Server containers via docker-compose
-make down         # Stop and remove containers
-make seed         # Run the seeder (populates in-memory GA4 data)
-make seed-stop    # Terminate seeder
-make migrate      # Apply SQL Server schema (create dbo/stage tables and indexes)
-make backfill     # Run Historical Backfill Flow (all 3 properties, 730 days)
-make daily        # Run Incremental Daily Flow (T-2 for all 3 properties)
-make realtime     # Run Realtime Pulse Flow (single snapshot, for testing)
+make up           # Start SQL Server + AuxDB containers via docker-compose
+make setup        # Full bootstrap: up -> AuxDB schema -> SQL Server schema
+make seed         # Start the GA4 mock seeder HTTP server (:11333)
+make seed-stop    # Stop the seeder process
+make down         # Stop containers (keep volumes)
+make reset        # Stop containers AND destroy volumes (DESTRUCTIVE)
 ```
 
 ---
@@ -533,11 +537,11 @@ The following are intentional scope boundaries for this case study — deferred 
 
 ### Phase 3 — GA4 Source Connector
 
-- [ ] **STEP-11** — Scaffold the connector package `client_connector_1_iso_entity_1` and define its internal state struct: `baseURL`, `property`, `surface`, `rowCount` (populated by `FetchRecords`, consumed by `NextPageToken`), `currentOffset`, and `quotaTokensSpent`. Implement bearer token attachment (static token for local seeder; OAuth2 service account for production GA4).
-- [ ] **STEP-12** — Implement `GeneratePaginateRequest` (§4.2) — constructs the `POST /v1beta/{property}:runReport` HTTP request with `Content-Type: application/json` and `Authorization: Bearer {token}` headers. JSON body includes all dimensions (§1.2), all metrics (§1.5), `dateRanges` set to the single-day window from `RESTAPISourceFetch`, `limit: 100000`, and `offset` parsed from `PageToken` (defaults to `0` on first call). Sets `RecordsPath = "rows"` and `MaxPages = 0`.
-- [ ] **STEP-13** — Implement `FetchRecords` (§4.3) — zips `dimensionHeaders` and `metricHeaders` arrays with the positional `dimensionValues` and `metricValues` arrays in each row to reconstruct `map[string]any` records. Parses metric values to `int64` for `TYPE_INTEGER` and `float64` for `TYPE_FLOAT` based on the `metricHeaders[i].type` field. Stores `rowCount` from the response into connector state for use by `NextPageToken`. Injects the response's quota cost (from `X-Quota-Token-Cost` header or estimated) as a `_quota_cost` field on each record for `QuotaThrottle` to consume.
-- [ ] **STEP-14** — Implement `NextPageToken` (§4.4) — uses `rowCount` stored in connector state and `currentOffset` to compute the next offset. Returns `(strconv.Itoa(nextOffset), true)` when more pages remain; returns `("", false)` when `currentOffset + 100000 >= rowCount`. Increments `currentOffset` after each successful call.
-- [ ] **STEP-15** — Implement `StreamRecords` (§4.5) — launches a goroutine containing a 60-second `time.Ticker` that calls `runRealtimeReport` for the configured property, parses each response row into `map[string]any`, and sends it to a buffered output channel (capacity 1,000). Returns the channel immediately. Goroutine exits cleanly on context cancellation, closing the channel.
+- [ ] **STEP-11** — Scaffold the connector package `client_connector_45_iso_entity_124` and define its internal state struct: `baseURL`, `property`, `surface`, and `quotaTokensSpent`. Implement bearer token attachment (static token for local seeder; OAuth2 service account for production GA4). No `rowCount`/`currentOffset` connector-state fields are needed — `NextPageToken` parses `rowCount` straight out of each response body and tracks the running offset in its own closure (see §4.2).
+- [ ] **STEP-12** — Implement `GeneratePaginateRequest` (§4.2) — constructs the `POST /v1beta/{property}:runReport` HTTP request with `Content-Type: application/json` and `Authorization: Bearer {token}` headers. JSON body includes all dimensions (§1.2), all metrics (§1.5), `dateRanges` set to the single-day window resolved from pipeline `State`, `limit: 100000`, and `offset: 0`. Sets `MaxPages = 0`. Sets the `ParseFn` and `NextPageToken` func fields on the returned tune (implemented in STEP-13/STEP-14).
+- [ ] **STEP-13** — Implement the `ParseFn` set by `GeneratePaginateRequest` (§4.2) — zips `dimensionHeaders` and `metricHeaders` arrays with the positional `dimensionValues` and `metricValues` arrays in each row to reconstruct `map[string]any` records. Parses metric values to `int64` for `TYPE_INTEGER` and `float64` for `TYPE_FLOAT` based on the `metricHeaders[i].type` field. Injects the response's quota cost (from `X-Quota-Token-Cost` header or estimated) as a `_quota_cost` field on each record for `QuotaThrottle` to consume.
+- [ ] **STEP-14** — Implement the `NextPageToken` func field set by `GeneratePaginateRequest` (§4.2) — parses `rowCount` directly out of the response `body` on each call and advances an offset counter tracked in its own closure (not connector-wide state). Returns `(strconv.Itoa(nextOffset), true)` when more pages remain; returns `("", false)` when `nextOffset >= rowCount`. Also stub `FetchRecords` (§4.3) to `panic(...)` — it backs `ReadByUserDefinedFunc` mode only and is never called by the engine for this paginate-mode connector.
+- [ ] **STEP-15** — Wire the Realtime Pulse Flow's recurring invocation (§4.4) — set the pipeline job's `ExecutionConfigJSON.RecurringInfo` (`ExecutionModeRecurringInfoImpl`) so the Streamcraft scheduler re-invokes the pipeline roughly every 60 seconds. Each invocation calls `GeneratePaginateRequest`/`ReadByPagination` against `runRealtimeReport` for the configured property — no ticker or channel inside the connector; `NextPageToken` always returns `("", false)` for this mode.
 - [ ] **STEP-16** — Stub out unused interface methods: `GenerateCursorRequest` and `GenerateWebhookRequest` both panic with `"GA4 connector does not support cursor/webhook mode"`. Prevents the engine from silently invoking an unimplemented path.
 
 ### Phase 4 — SQL Server Destination Connector
@@ -555,7 +559,7 @@ The following are intentional scope boundaries for this case study — deferred 
 - [ ] **STEP-24** — Implement `PropertyInjector` transformer — reads `property_id` from `TransformerProps.State` and stamps it on the record. Required for the composite primary key `(property_id, report_date, session_id)` in `dbo.ga4_sessions`.
 - [ ] **STEP-25** — Implement `NullFiller` transformer — iterates over all columns defined in the `dbo.ga4_sessions` schema. For `NOT NULL VARCHAR`/`CHAR` columns: if the field is absent or `nil`, sets it to `""`. For `NOT NULL INT`/`DECIMAL` columns: sets missing values to `0`. Prevents SQL Server insert failures on `NOT NULL` constraint violations.
 - [ ] **STEP-26** — Implement `MetricTypeCaster` transformer — GA4 returns all metric values as strings (e.g., `"sessions": "3"`). Parses string → `int64` for integer metrics (`sessions`, `engaged_sessions`, `total_users`, `new_users`, `conversions`, `event_count`, `screen_page_views`) and string → `float64` for float metrics (`bounce_rate`, `avg_session_duration_secs`, `purchase_revenue_inr`). Routes records where parsing fails (e.g., `"(not set)"`) to backlog with error code `METRIC_PARSE_FAILURE`.
-- [ ] **STEP-27** — Implement `QuotaThrottle` transformer — maintains an in-memory `map[propertyID]int` of tokens spent in the current hour window. Reads the `_quota_cost` field injected by `FetchRecords` and accumulates it per property. When hourly spend for a property exceeds 32,000 tokens (80% of the 40K hourly limit), calls `time.Sleep` until the next hour boundary before passing the record through. Strips `_quota_cost` from the record before forwarding. Blocks rather than rejects — this is a throttle, not a backlog route.
+- [ ] **STEP-27** — Implement `QuotaThrottle` transformer — maintains an in-memory `map[propertyID]int` of tokens spent in the current hour window. Reads the `_quota_cost` field injected by `GeneratePaginateRequest`'s `ParseFn` (§4.2) and accumulates it per property. When hourly spend for a property exceeds 32,000 tokens (80% of the 40K hourly limit), calls `time.Sleep` until the next hour boundary before passing the record through. Strips `_quota_cost` from the record before forwarding. Blocks rather than rejects — this is a throttle, not a backlog route.
 - [ ] **STEP-28** — Implement `RunIDStamper` transformer — stamps `pipeline_run_id` (from pipeline context) and `ingested_at` (`time.Now().UTC()`) on every record. Both fields are written to `dbo.ga4_sessions` and updated on each upsert via the MERGE statement.
 
 ### Phase 6 — Pipeline Collections
@@ -563,14 +567,14 @@ The following are intentional scope boundaries for this case study — deferred 
 - [ ] **STEP-29** — Implement the **Historical Backfill Flow** driver (`cmd/backfill/main.go`) — accepts `--property` and `--date-from`/`--date-to` flags. Generates the list of calendar days in the range and enqueues them as pipeline jobs. Runs up to 3 dates concurrently per property (§3.1) using a worker pool. Before processing each date, checks `dbo.pipeline_run_log` for an existing completed row for that `(property_id, date)` and skips if found. Processes the three properties sequentially with a 2-minute gap between them to avoid cross-property quota collisions on the same GCP service account.
 - [ ] **STEP-30** — Wire the Historical Backfill pipeline: source = `client_connector_1_iso_entity_1` in paginate mode, transformer chain = `DateParser` → `DimensionNormaliser` → `SurfaceInjector` → `PropertyInjector` → `NullFiller` → `MetricTypeCaster` → `QuotaThrottle` → `RunIDStamper`, destination = `connector_dest_sqlserver` (truncate stage → bulk insert → MERGE). Write run metadata to `dbo.pipeline_run_log` on start and on completion.
 - [ ] **STEP-31** — Implement the **Incremental Daily Flow** driver (`cmd/daily/main.go`) — calculates target dates `T-2` (primary, fully settled) and `T-1` (precautionary re-upsert). Runs the paginated pipeline for all three properties in sequence for both dates using the same pipeline wiring as the backfill flow. Designed to be invoked by a cron scheduler at 06:00 IST daily.
-- [ ] **STEP-32** — Implement the **Realtime Pulse Flow** driver (`cmd/realtime/main.go`) — calls `StreamRecords` on `client_connector_1_iso_entity_1` for all three properties concurrently (one goroutine per property). Feeds rows through a trimmed transformer chain (`SurfaceInjector` → `PropertyInjector` → `NullFiller` → `RunIDStamper` only — no date parsing, no dimension normalisation, no quota throttle). Writes rows to `dbo.realtime_sessions` via the realtime destination path. Designed to be invoked every 60 seconds by the Streamcraft scheduler.
+- [ ] **STEP-32** — Implement the **Realtime Pulse Flow** driver (`cmd/realtime/main.go`) — for each of the three properties, calls `GeneratePaginateRequest`/`ReadByPagination` against `runRealtimeReport` (single-shot, no pagination; §4.4). Feeds rows through a trimmed transformer chain (`SurfaceInjector` → `PropertyInjector` → `NullFiller` → `RunIDStamper` only — no date parsing, no dimension normalisation, no quota throttle). Writes rows to `dbo.realtime_sessions` via the realtime destination path. The driver itself does not loop or schedule anything — the job's recurring execution config (§4.4) is what causes the Streamcraft scheduler to invoke it roughly every 60 seconds.
 
 ### Phase 7 — Pipeline Control Plane
 
 - [ ] **STEP-33** — Implement checkpoint/resume for the Backfill Flow — on each successfully merged date, write a row to `dbo.pipeline_run_log` with `status = 'COMPLETED'` and `report_date` captured in `pipeline_name` metadata. On restart, the backfill driver queries completed dates for the property and excludes them from the work queue.
 - [ ] **STEP-34** — Implement backlog handling — records that fail transformer processing (invalid date, metric parse failure) are captured in a per-run `[]map[string]any` slice. At the end of each pipeline run, write accumulated backlog records to `dbo.pipeline_backlog` with columns: `run_id`, `property_id`, `report_date`, `error_code`, `error_message`, `raw_record` (JSON), `created_at`.
 - [ ] **STEP-35** — Implement `TerminateRule` evaluation — checked at the start of each date-batch in the backfill/daily flows and each tick in the realtime flow. Rules: `ERROR_RATE_BREACH` (backlog rate > 10% of batch records → stop), `SOURCE_UNREACHABLE` (HTTP 5xx from GA4/seeder after 3 retries → stop), `QUOTA_EXHAUSTED` (HTTP 429 with no retry budget remaining → stop), `IDLE_TIMEOUT` (zero rows returned for a property across 3 consecutive date requests → stop), `MANUAL_KILL` (`FORCE_STOP=true` environment flag set → graceful stop at next checkpoint). Store rules and thresholds in `internal/control/terminate.go`.
-- [ ] **STEP-36** — Implement exponential backoff on HTTP 429 in `FetchRecords` — base delay 5s, multiplier 2×, cap 300s, with ±20% jitter. Logs each retry with property ID, current offset, and remaining backoff duration. After 5 consecutive 429 responses with no recovery, returns an error to the engine to trigger `QUOTA_EXHAUSTED` termination.
+- [ ] **STEP-36** — Implement exponential backoff on HTTP 429 in the `ParseFn` set by `GeneratePaginateRequest` (§4.2) — base delay 5s, multiplier 2×, cap 300s, with ±20% jitter. Logs each retry with property ID, current offset, and remaining backoff duration. After 5 consecutive 429 responses with no recovery, returns an error to the engine to trigger `QUOTA_EXHAUSTED` termination.
 
 ### Phase 8 — Observability
 
