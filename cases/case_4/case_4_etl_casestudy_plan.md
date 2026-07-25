@@ -129,9 +129,9 @@ The seeder injects three fault types in round-robin at the configured `FAULT_RAT
 
 | Fault Type | Mutation | Pipeline Effect |
 |---|---|---|
-| **Type A** | `city = ""` (empty string) | `transformer_81` returns `nil` — record silently dropped, increments the `records-dropped` metric |
-| **Type B** | `created_at = "INVALID_TIMESTAMP"` | `transformer_88` returns a parse error — record routed to `zepto_storage_backlog` (Flow 2 backlog) |
-| **Type C** | `payload["_fault_inject"] = "error"` | `transformer_81` returns an error — record routed to `zepto_ingestion_backlog` (Flow 1 backlog) |
+| **Type A** | `city = ""` (empty string) | `transformer_1` returns `nil` — record silently dropped, increments the `records-dropped` metric |
+| **Type B** | `created_at = "INVALID_TIMESTAMP"` | `transformer_4` returns a parse error — record routed to `zepto_storage_backlog` (Flow 2 backlog) |
+| **Type C** | `payload["_fault_inject"] = "error"` | `transformer_1` returns an error — record routed to `zepto_ingestion_backlog` (Flow 1 backlog) |
 
 Fault types cycle in sequence so every failure path fires during a single test run. At the default `FAULT_RATE=5%`, one fault fires every 20 records.
 
@@ -281,7 +281,7 @@ CREATE TABLE IF NOT EXISTS zepto_ingestion_backlog (
 ```
 
 Records routed here by:
-- `transformer_81` when `payload["_fault_inject"]` is present (Fault Type C)
+- `transformer_1` when `payload["_fault_inject"]` is present (Fault Type C)
 - Kafka publish timeout or broker unavailability (destination-stage failure)
 
 `failure_stage` values: `transform`, `destination`.
@@ -321,7 +321,7 @@ CREATE TABLE IF NOT EXISTS zepto_storage_backlog (
 Includes `kafka_topic`, `kafka_partition`, and `kafka_offset` so a backlog replay tool can seek to the exact Kafka position and reprocess the failed record without scanning from the beginning.
 
 Records routed here by:
-- `transformer_88` when `created_at` cannot be parsed as RFC3339 (Fault Type B)
+- `transformer_4` when `created_at` cannot be parsed as RFC3339 (Fault Type B)
 - `gocql` connection failure when Cassandra is unavailable (destination-stage failure)
 
 `failure_stage` values: `transform`, `destination`.
@@ -353,13 +353,13 @@ Records routed here by:
 
 | Transformer | ID | Responsibility |
 |---|---|---|
-| `CityValidator` | transformer_81 | Validates `city` is non-empty. Empty city → `nil` return (silent drop, increments records-dropped). `_fault_inject` in payload → error return (routes to `zepto_ingestion_backlog`). |
-| `AmountTypeCaster` | transformer_82 | Parses `amount` from `float64` to a typed decimal. Validates it is > 0. |
-| `PayloadSerialiser` | transformer_83 | JSON-encodes the `payload` map to a string for Cassandra's `text` column. |
+| `CityValidator` | transformer_1 | Validates `city` is non-empty. Empty city → `nil` return (silent drop, increments records-dropped). `_fault_inject` in payload → error return (routes to `zepto_ingestion_backlog`). |
+| `AmountTypeCaster` | transformer_2 | Parses `amount` from `float64` to a typed decimal. Validates it is > 0. |
+| `PayloadSerialiser` | transformer_3 | JSON-encodes the `payload` map to a string for Cassandra's `text` column. |
 
-**Fault path — ingestion backlog**: `transformer_81` returns an error on Fault Type C records. The engine routes the record to `zepto_ingestion_backlog` with `failure_stage = transform`.
+**Fault path — ingestion backlog**: `transformer_1` returns an error on Fault Type C records. The engine routes the record to `zepto_ingestion_backlog` with `failure_stage = transform`.
 
-**Fault path — silent drop**: `transformer_81` returns `nil` on Fault Type A records (empty city). The engine increments the `records-dropped` pipeline metric and moves to the next record. No backlog entry is created — empty-city records are structurally unparseable for Cassandra's `(city, store_id)` partition key.
+**Fault path — silent drop**: `transformer_1` returns `nil` on Fault Type A records (empty city). The engine increments the `records-dropped` pipeline metric and moves to the next record. No backlog entry is created — empty-city records are structurally unparseable for Cassandra's `(city, store_id)` partition key.
 
 ### 5.2 Flow 2 — Stream Storage Flow (Kafka → Cassandra)
 
@@ -381,11 +381,11 @@ Records routed here by:
 
 | Transformer | ID | Responsibility |
 |---|---|---|
-| `TimestampParser` | transformer_88 | Parses `created_at` string (RFC3339) into a typed `time.Time`. Unparseable strings (e.g., `"INVALID_TIMESTAMP"`) → error return (routes to `zepto_storage_backlog`). |
-| `EventIDParser` | transformer_89 | Parses `event_id` hex string into a Cassandra-compatible UUID. Malformed IDs → error return. |
-| `RunIDStamper` | transformer_90 | Stamps `run_id` from pipeline context onto each record. Used for per-run traceability in Cassandra. |
+| `TimestampParser` | transformer_4 | Parses `created_at` string (RFC3339) into a typed `time.Time`. Unparseable strings (e.g., `"INVALID_TIMESTAMP"`) → error return (routes to `zepto_storage_backlog`). |
+| `EventIDParser` | transformer_5 | Parses `event_id` hex string into a Cassandra-compatible UUID. Malformed IDs → error return. |
+| `RunIDStamper` | transformer_6 | Stamps `run_id` from pipeline context onto each record. Used for per-run traceability in Cassandra. |
 
-**Fault path — storage backlog**: `transformer_88` returns an error on Fault Type B records. The engine routes the record to `zepto_storage_backlog` with `failure_stage = transform`, including the Kafka coordinates (`topic`, `partition`, `offset`) so the record can be replayed precisely.
+**Fault path — storage backlog**: `transformer_4` returns an error on Fault Type B records. The engine routes the record to `zepto_storage_backlog` with `failure_stage = transform`, including the Kafka coordinates (`topic`, `partition`, `offset`) so the record can be replayed precisely.
 
 ---
 
@@ -447,24 +447,24 @@ Two independent pipeline collections — one per flow. Each collection has a sin
 ```
 Collection  = Zepto Order Events Pipeline
   │
-  ├── Flow 1 — Cursor Ingestion (pid=28)        [REST API → Kafka]
+  ├── Flow 1 — Cursor Ingestion (pid=1)        [REST API → Kafka]
   │     └── pipeline_order_events_ingestion
   │           source:      Zepto REST API cursor connector
-  │           transformers: transformer_81 → transformer_82 → transformer_83
+  │           transformers: transformer_1 → transformer_2 → transformer_3
   │           destination: Kafka topic zepto.order.events
   │           checkpoint:  zepto_ingestion_cursors (AuxDB)
   │           backlog:     zepto_ingestion_backlog (AuxDB)
   │
-  └── Flow 2 — Stream Storage (pid=29)          [Kafka → Cassandra]
+  └── Flow 2 — Stream Storage (pid=2)          [Kafka → Cassandra]
         └── pipeline_order_events_storage
               source:      Kafka topic zepto.order.events (3 partitions)
-              transformers: transformer_88 → transformer_89 → transformer_90
+              transformers: transformer_4 → transformer_5 → transformer_6
               destination: Cassandra zepto_events.order_events
               checkpoint:  zepto_storage_offsets (AuxDB)
               backlog:     zepto_storage_backlog (AuxDB)
 ```
 
-> **Start order**: Flow 2 (pid=29) must be started before Flow 1 (pid=28). If Flow 1 starts first and publishes events before Flow 2 has created its consumer group, the Kafka topic may auto-rotate offsets past the point where Flow 2 begins reading — events would be silently skipped. Starting the consumer before the producer is standard Kafka practice.
+> **Start order**: Flow 2 (pid=2) must be started before Flow 1 (pid=1). If Flow 1 starts first and publishes events before Flow 2 has created its consumer group, the Kafka topic may auto-rotate offsets past the point where Flow 2 begins reading — events would be silently skipped. Starting the consumer before the producer is standard Kafka practice.
 
 ### 7.2 Connectors
 
@@ -548,13 +548,13 @@ make seed-backlog N=50     # inserts 50 rows into each backlog table
 
 Ingestion backlog entries simulate:
 - Kafka leader-not-available errors (`failure_stage = destination`)
-- `transformer_81` JSON type errors (`failure_stage = transform`)
+- `transformer_1` JSON type errors (`failure_stage = transform`)
 - Kafka request timeout (`failure_stage = destination`)
 
 Storage backlog entries simulate:
-- `transformer_88` timestamp parse failures (`failure_stage = transform`)
+- `transformer_4` timestamp parse failures (`failure_stage = transform`)
 - `gocql` no-connections-available errors (`failure_stage = destination`)
-- `transformer_88` missing `created_at` field (`failure_stage = transform`)
+- `transformer_4` missing `created_at` field (`failure_stage = transform`)
 
 ---
 
@@ -597,7 +597,7 @@ make watch INTERVAL=10s                  # 10-second poll
   zepto_storage_backlog   (Flow 2 failed writes)    : 7
 
   Recent ingestion backlog entries:
-    ORD-00000020  event-id-...  transform  2026-06-17 14:31:50  transformer_81: ...
+    ORD-00000020  event-id-...  transform  2026-06-17 14:31:50  transformer_1: ...
 
 (refreshes every few seconds — Ctrl+C to exit)
 ```
@@ -608,7 +608,7 @@ make watch INTERVAL=10s                  # 10-second poll
 |---|---|---|
 | Cursor not advancing | 3+ consecutive ticks | Flow 1 stalled — API unreachable or Kafka publish failing |
 | Offset not advancing | Any partition idle 3+ ticks | Flow 2 stalled — Cassandra unreachable or consumer paused |
-| Ingestion backlog growing | Rate > 5% of published events | Fault rate high; or `transformer_81` config issue |
+| Ingestion backlog growing | Rate > 5% of published events | Fault rate high; or `transformer_1` config issue |
 | Storage backlog growing | Rate > 5% of consumed events | Bad timestamps in source data; or Cassandra schema mismatch |
 
 ---
@@ -692,15 +692,15 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 
 ### Phase 6 — Transformer Chains
 
-- [ ] **STEP-19** — Implement `transformer_81` (`CityValidator`) for Flow 1:
+- [ ] **STEP-19** — Implement `transformer_1` (`CityValidator`) for Flow 1:
   - If `city == ""`: return `nil` (silent drop — engine increments records-dropped metric).
-  - If `payload["_fault_inject"] == "error"`: return error `"transformer_81: fault inject marker present"` — engine routes to `zepto_ingestion_backlog`.
+  - If `payload["_fault_inject"] == "error"`: return error `"transformer_1: fault inject marker present"` — engine routes to `zepto_ingestion_backlog`.
   - Otherwise: pass record through unchanged.
-- [ ] **STEP-20** — Implement `transformer_82` (`AmountTypeCaster`) for Flow 1: asserts `amount` is a `float64` > 0. Returns error for zero or negative amounts. Passes through unchanged on success. (Amount is already `float64` from JSON; this transformer validates rather than parses.)
-- [ ] **STEP-21** — Implement `transformer_83` (`PayloadSerialiser`) for Flow 1: JSON-marshals `record["payload"]` (a `map[string]any`) to a JSON string and replaces the map with the string. Cassandra stores `payload` as `text`. Returns error only if `json.Marshal` fails (should not occur with a well-typed map).
-- [ ] **STEP-22** — Implement `transformer_88` (`TimestampParser`) for Flow 2: parses `record["created_at"]` string as RFC3339 (`time.Parse(time.RFC3339, v)`). Returns error `"transformer_88: parse created_at <value>: ..."` on failure (Fault Type B records hit this path). Stores the parsed `time.Time` back onto the record for the Cassandra connector to use.
-- [ ] **STEP-23** — Implement `transformer_89` (`EventIDParser`) for Flow 2: parses `record["event_id"]` hex string into a `gocql.UUID`. Returns error on malformed UUIDs. The Cassandra `event_id uuid` column requires a typed UUID, not a raw string.
-- [ ] **STEP-24** — Implement `transformer_90` (`RunIDStamper`) for Flow 2: reads `pipeline_run_id` from pipeline context and stamps it onto the record as `run_id`. Pure enrichment — no error path.
+- [ ] **STEP-20** — Implement `transformer_2` (`AmountTypeCaster`) for Flow 1: asserts `amount` is a `float64` > 0. Returns error for zero or negative amounts. Passes through unchanged on success. (Amount is already `float64` from JSON; this transformer validates rather than parses.)
+- [ ] **STEP-21** — Implement `transformer_3` (`PayloadSerialiser`) for Flow 1: JSON-marshals `record["payload"]` (a `map[string]any`) to a JSON string and replaces the map with the string. Cassandra stores `payload` as `text`. Returns error only if `json.Marshal` fails (should not occur with a well-typed map).
+- [ ] **STEP-22** — Implement `transformer_4` (`TimestampParser`) for Flow 2: parses `record["created_at"]` string as RFC3339 (`time.Parse(time.RFC3339, v)`). Returns error `"transformer_4: parse created_at <value>: ..."` on failure (Fault Type B records hit this path). Stores the parsed `time.Time` back onto the record for the Cassandra connector to use.
+- [ ] **STEP-23** — Implement `transformer_5` (`EventIDParser`) for Flow 2: parses `record["event_id"]` hex string into a `gocql.UUID`. Returns error on malformed UUIDs. The Cassandra `event_id uuid` column requires a typed UUID, not a raw string.
+- [ ] **STEP-24** — Implement `transformer_6` (`RunIDStamper`) for Flow 2: reads `pipeline_run_id` from pipeline context and stamps it onto the record as `run_id`. Pure enrichment — no error path.
 
 ### Phase 7 — Pipeline Control Plane
 
@@ -726,12 +726,12 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 - [ ] **STEP-32** — Run `make setup` (Docker up → wait healthy → `make auxdb` → `make cassandra`). Verify all 4 AuxDB tables exist via `psql`. Verify Cassandra keyspace and table exist via `cqlsh -e "DESCRIBE zepto_events.order_events"`.
 - [ ] **STEP-33** — Run `make seed` with defaults (`TOTAL_EVENTS=2000 FAULT_RATE=5`). Verify seeder is reachable: `curl -H "X-Internal-Token: dev-token" "http://localhost:11334/api/v2/order-events?limit=10"`. Confirm response shape: `events` array, `next_cursor`, `has_more=true`.
 - [ ] **STEP-34** — Run `make seed-backlog`. Verify both AuxDB backlog tables contain 20 rows each. Run `make watch` to confirm the metrics dashboard shows non-zero backlog counts.
-- [ ] **STEP-35** — Start Flow 2 (pid=29) first. Verify it creates the Kafka consumer group and begins waiting for messages. Then start Flow 1 (pid=28). Verify Flow 1 begins publishing events and `zepto_ingestion_cursors` shows a non-empty `last_cursor` within the first poll interval.
+- [ ] **STEP-35** — Start Flow 2 (pid=2) first. Verify it creates the Kafka consumer group and begins waiting for messages. Then start Flow 1 (pid=1). Verify Flow 1 begins publishing events and `zepto_ingestion_cursors` shows a non-empty `last_cursor` within the first poll interval.
 - [ ] **STEP-36** — After 1–2 minutes of execution, query Cassandra: `SELECT COUNT(*) FROM zepto_events.order_events;`. Confirm rows are accumulating. Query `zepto_storage_offsets` and confirm `last_offset` is advancing on all 3 partitions.
 - [ ] **STEP-37** — Verify fault handling: with `FAULT_RATE=5` and `TOTAL_EVENTS=2000`, expect ~33 fault records (5% of 2000, split across 3 fault types). Confirm:
   - ~11 Fault Type A records: silent drops — no backlog rows, but records-dropped counter incremented in pipeline metrics
-  - ~11 Fault Type B records: appear in `zepto_storage_backlog` with `failure_stage=transform` and `transformer_88` error
-  - ~11 Fault Type C records: appear in `zepto_ingestion_backlog` with `failure_stage=transform` and `transformer_81` error
+  - ~11 Fault Type B records: appear in `zepto_storage_backlog` with `failure_stage=transform` and `transformer_4` error
+  - ~11 Fault Type C records: appear in `zepto_ingestion_backlog` with `failure_stage=transform` and `transformer_1` error
 - [ ] **STEP-38** — Test checkpoint/resume for Flow 1: kill Flow 1 mid-run. Note the `last_cursor` value in `zepto_ingestion_cursors`. Restart Flow 1. Confirm it resumes from that cursor and does not re-publish already-committed pages.
 - [ ] **STEP-39** — Test checkpoint/resume for Flow 2: kill Flow 2 mid-run. Note the `last_offset` values in `zepto_storage_offsets`. Restart Flow 2. Confirm it resumes from `last_offset + 1` per partition and does not re-write already-committed records to Cassandra (idempotent upsert by primary key: `(city, store_id, event_type, created_at, event_id)`).
 - [ ] **STEP-40** — Test TTL enforcement: insert a synthetic Cassandra row directly via `cqlsh` with `USING TTL 10` (10 seconds). Wait 12 seconds. Confirm the row is no longer returned by `SELECT`. This validates TWCS compaction and TTL are working correctly in the local cluster.
@@ -752,8 +752,8 @@ AUXDB_DSN=postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 | Clustering | `event_type ASC, created_at DESC, event_id ASC` |
 | Flows | 2: Cursor Ingestion (REST API → Kafka) + Stream Storage (Kafka → Cassandra) |
 | Pipelines | 1 per flow = 2 total |
-| Flow 1 transformer chain | `transformer_81` (CityValidator) → `transformer_82` (AmountTypeCaster) → `transformer_83` (PayloadSerialiser) |
-| Flow 2 transformer chain | `transformer_88` (TimestampParser) → `transformer_89` (EventIDParser) → `transformer_90` (RunIDStamper) |
+| Flow 1 transformer chain | `transformer_1` (CityValidator) → `transformer_2` (AmountTypeCaster) → `transformer_3` (PayloadSerialiser) |
+| Flow 2 transformer chain | `transformer_4` (TimestampParser) → `transformer_5` (EventIDParser) → `transformer_6` (RunIDStamper) |
 | Fault types | A: silent drop (empty city) · B: storage backlog (invalid timestamp) · C: ingestion backlog (fault-inject payload) |
 | AuxDB tables | 4: `zepto_ingestion_cursors`, `zepto_ingestion_backlog`, `zepto_storage_offsets`, `zepto_storage_backlog` |
 | Control plane | Per-flow checkpointing (cursor for Flow 1, per-partition offsets for Flow 2) + separate backlogs per flow |

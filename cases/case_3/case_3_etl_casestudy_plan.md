@@ -287,7 +287,7 @@ The `WHEN NOT MATCHED BY SOURCE` clause is intentionally **omitted** — the pip
 
 ## Part 4 — IClientRESTAPISource Implementation
 
-The Go connector package is `client_connector_45_iso_entity_124`. It implements `coreinterface.IClientRESTAPISource` for the GA4 Data API.
+The Go connector package is `client_connector_1_iso_entity_1`. It implements `coreinterface.IClientRESTAPISource` for the GA4 Data API.
 
 ### 4.1 Interface Method Mapping
 
@@ -536,7 +536,7 @@ The following are intentional scope boundaries for this case study — deferred 
 
 ### Phase 3 — GA4 Source Connector
 
-- [ ] **STEP-11** — Scaffold the connector package `client_connector_45_iso_entity_124` and define its internal state struct: `baseURL`, `property`, `surface`, `rowCount` (populated by `FetchRecords`, consumed by `NextPageToken`), `currentOffset`, and `quotaTokensSpent`. Implement bearer token attachment (static token for local seeder; OAuth2 service account for production GA4).
+- [ ] **STEP-11** — Scaffold the connector package `client_connector_1_iso_entity_1` and define its internal state struct: `baseURL`, `property`, `surface`, `rowCount` (populated by `FetchRecords`, consumed by `NextPageToken`), `currentOffset`, and `quotaTokensSpent`. Implement bearer token attachment (static token for local seeder; OAuth2 service account for production GA4).
 - [ ] **STEP-12** — Implement `GeneratePaginateRequest` (§4.2) — constructs the `POST /v1beta/{property}:runReport` HTTP request with `Content-Type: application/json` and `Authorization: Bearer {token}` headers. JSON body includes all dimensions (§1.2), all metrics (§1.5), `dateRanges` set to the single-day window from `RESTAPISourceFetch`, `limit: 100000`, and `offset` parsed from `PageToken` (defaults to `0` on first call). Sets `RecordsPath = "rows"` and `MaxPages = 0`.
 - [ ] **STEP-13** — Implement `FetchRecords` (§4.3) — zips `dimensionHeaders` and `metricHeaders` arrays with the positional `dimensionValues` and `metricValues` arrays in each row to reconstruct `map[string]any` records. Parses metric values to `int64` for `TYPE_INTEGER` and `float64` for `TYPE_FLOAT` based on the `metricHeaders[i].type` field. Stores `rowCount` from the response into connector state for use by `NextPageToken`. Injects the response's quota cost (from `X-Quota-Token-Cost` header or estimated) as a `_quota_cost` field on each record for `QuotaThrottle` to consume.
 - [ ] **STEP-14** — Implement `NextPageToken` (§4.4) — uses `rowCount` stored in connector state and `currentOffset` to compute the next offset. Returns `(strconv.Itoa(nextOffset), true)` when more pages remain; returns `("", false)` when `currentOffset + 100000 >= rowCount`. Increments `currentOffset` after each successful call.
@@ -564,9 +564,9 @@ The following are intentional scope boundaries for this case study — deferred 
 ### Phase 6 — Pipeline Collections
 
 - [ ] **STEP-29** — Implement the **Historical Backfill Flow** driver (`cmd/backfill/main.go`) — accepts `--property` and `--date-from`/`--date-to` flags. Generates the list of calendar days in the range and enqueues them as pipeline jobs. Runs up to 3 dates concurrently per property (§3.1) using a worker pool. Before processing each date, checks `dbo.pipeline_run_log` for an existing completed row for that `(property_id, date)` and skips if found. Processes the three properties sequentially with a 2-minute gap between them to avoid cross-property quota collisions on the same GCP service account.
-- [ ] **STEP-30** — Wire the Historical Backfill pipeline: source = `client_connector_45_iso_entity_124` in paginate mode, transformer chain = `DateParser` → `DimensionNormaliser` → `SurfaceInjector` → `PropertyInjector` → `NullFiller` → `MetricTypeCaster` → `QuotaThrottle` → `RunIDStamper`, destination = `connector_dest_sqlserver` (truncate stage → bulk insert → MERGE). Write run metadata to `dbo.pipeline_run_log` on start and on completion.
+- [ ] **STEP-30** — Wire the Historical Backfill pipeline: source = `client_connector_1_iso_entity_1` in paginate mode, transformer chain = `DateParser` → `DimensionNormaliser` → `SurfaceInjector` → `PropertyInjector` → `NullFiller` → `MetricTypeCaster` → `QuotaThrottle` → `RunIDStamper`, destination = `connector_dest_sqlserver` (truncate stage → bulk insert → MERGE). Write run metadata to `dbo.pipeline_run_log` on start and on completion.
 - [ ] **STEP-31** — Implement the **Incremental Daily Flow** driver (`cmd/daily/main.go`) — calculates target dates `T-2` (primary, fully settled) and `T-1` (precautionary re-upsert). Runs the paginated pipeline for all three properties in sequence for both dates using the same pipeline wiring as the backfill flow. Designed to be invoked by a cron scheduler at 06:00 IST daily.
-- [ ] **STEP-32** — Implement the **Realtime Pulse Flow** driver (`cmd/realtime/main.go`) — calls `StreamRecords` on `client_connector_45_iso_entity_124` for all three properties concurrently (one goroutine per property). Feeds rows through a trimmed transformer chain (`SurfaceInjector` → `PropertyInjector` → `NullFiller` → `RunIDStamper` only — no date parsing, no dimension normalisation, no quota throttle). Writes rows to `dbo.realtime_sessions` via the realtime destination path. Designed to be invoked every 60 seconds by the Streamcraft scheduler.
+- [ ] **STEP-32** — Implement the **Realtime Pulse Flow** driver (`cmd/realtime/main.go`) — calls `StreamRecords` on `client_connector_1_iso_entity_1` for all three properties concurrently (one goroutine per property). Feeds rows through a trimmed transformer chain (`SurfaceInjector` → `PropertyInjector` → `NullFiller` → `RunIDStamper` only — no date parsing, no dimension normalisation, no quota throttle). Writes rows to `dbo.realtime_sessions` via the realtime destination path. Designed to be invoked every 60 seconds by the Streamcraft scheduler.
 
 ### Phase 7 — Pipeline Control Plane
 
