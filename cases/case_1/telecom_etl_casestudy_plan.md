@@ -305,7 +305,7 @@ Each lane writes to a non-overlapping Postgres partition — zero contention.
   "flowDefinition": [
     {
       "flow": { "pid": 1, "name": "vodafone_north" },
-      "pipelineOrchestratorDefintion": { "Name": "telecom_pipeline_orchestrator", "PID": 2 },
+      "pipelineOrchestratorDefinition": { "Name": "telecom_pipeline_orchestrator", "PID": 2 },
       "source": { "type": "mysql", "connectionParams": "..." },
       "destination": { "type": "postgres", "connectionParams": "..." },
       "pipelines": [
