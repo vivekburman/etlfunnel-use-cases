@@ -15,12 +15,13 @@
 #   - Docker Desktop running
 #
 # WINDOWS NOTE:
-#   FC_SNAPSHOT_DIR/FC_MOVEMENT_DIR default to /data/fc_inventory_snapshots
-#   and /data/wms_stock_movements — deliberately matching the literal
-#   defaults baked into streamcraftexecution's orchestrator_21/orchestrator_22
-#   and hardcoded in its collection.json connectionParams. Those can't be
-#   pointed anywhere else without editing that repo, so this Makefile must
-#   land files at the exact same place the execution side resolves to.
+#   On Windows, FC_SNAPSHOT_DIR/FC_MOVEMENT_DIR default to
+#   /data/fc_inventory_snapshots and /data/wms_stock_movements —
+#   deliberately matching the literal defaults baked into
+#   streamcraftexecution's orchestrator_21/orchestrator_22 and hardcoded in
+#   its collection.json connectionParams. Those can't be pointed anywhere
+#   else without editing that repo, so this Makefile must land files at the
+#   exact same place the execution side resolves to.
 #
 #   On native Windows (Go, PowerShell), a rooted path with no drive letter
 #   like "/data/..." resolves relative to the current drive, i.e.
@@ -33,6 +34,18 @@
 #   resolve "/data/..." to. Create C:\data\fc_inventory_snapshots and
 #   C:\data\wms_stock_movements once (no admin rights needed); both sides
 #   then agree without either repo needing a path override.
+#
+# MACOS/LINUX NOTE:
+#   "/data/..." doesn't work here — on macOS the root volume is sealed and
+#   read-only (SIP), and on Linux it's usually root-owned, so mkdir fails
+#   either way. There's no drive-letter trick to fall back on like Windows
+#   has, so FC_SNAPSHOT_DIR/FC_MOVEMENT_DIR instead default to this repo's
+#   own tmp/ scratch dir (user space, no root needed). streamcraftexecution's
+#   orchestrators already read these same env vars at runtime and only fall
+#   back to the hardcoded /data/... default when unset (see
+#   orchestrator_1/orchestrator.go, orchestrator_2/orchestrator.go), so
+#   export FC_SNAPSHOT_DIR/FC_MOVEMENT_DIR with these same values when
+#   running the flow locally so both sides agree.
 #
 # USAGE:
 #   make up             — start AuxDB + MongoDB containers and wait for healthy
@@ -49,7 +62,9 @@
 #   make seed-movement
 #   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement) — no ordering constraint
 
+ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
+endif
 .SHELLFLAGS := -euo pipefail -c
 
 export GOTMPDIR := $(CURDIR)/tmp
@@ -63,9 +78,14 @@ COMPOSE_FILE := docker-compose.yml
 AUXDB_DSN       ?= postgresql://etl_user:etl_pass@localhost:5446/auxdb?sslmode=disable
 # Creds must match collection.json's hardcoded Mongo destination connectionParams.
 MONGO_URI       ?= mongodb://etl_user:etl_pass@localhost:27017/?authSource=admin
-# Must match streamcraftexecution's defaults exactly — see "WINDOWS NOTE" above.
+# See "WINDOWS NOTE" / "MACOS/LINUX NOTE" above for why this default differs by OS.
+ifeq ($(OS),Windows_NT)
 FC_SNAPSHOT_DIR ?= /data/fc_inventory_snapshots
 FC_MOVEMENT_DIR ?= /data/wms_stock_movements
+else
+FC_SNAPSHOT_DIR ?= $(CURDIR)/tmp/data/fc_inventory_snapshots
+FC_MOVEMENT_DIR ?= $(CURDIR)/tmp/data/wms_stock_movements
+endif
 TOTAL_ROWS      ?= 1500
 ROWS_PER_PART   ?= 1000
 NEW_MOVEMENTS   ?= 2000

@@ -22,7 +22,9 @@
 #   ZEPTO_API_BASE_URL=http://localhost:11334
 #   ZEPTO_API_TOKEN=dev-token   (seeder accepts any non-empty value)
 
+ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
+endif
 .SHELLFLAGS := -euo pipefail -c
 
 export GOTMPDIR := $(CURDIR)/tmp

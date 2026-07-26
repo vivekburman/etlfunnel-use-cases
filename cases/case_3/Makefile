@@ -13,7 +13,9 @@
 # SEED OVERRIDES:
 #   make seed ROWS_PER_DAY=5000 SEEDER_PORT=11333
 
+ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
+endif
 .SHELLFLAGS := -euo pipefail -c
 
 # Redirect Go build cache to a local dir so Windows doesn't block execution from %TEMP%
