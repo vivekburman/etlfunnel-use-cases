@@ -317,7 +317,7 @@ Each lane writes to a non-overlapping Postgres partition — zero contention.
           "checkpoint": { "pid": 1 },
           "backlog": { "pid": 1 },
           "terminate": { "pid": 1 },
-          "auxilaryHubs": [
+          "auxiliaryHubs": [
             { "name": "auxdb", "type": "postgres", "connectionParams": "..." }
           ]
         }
