@@ -48,18 +48,23 @@
 #   running the flow locally so both sides agree.
 #
 # USAGE:
-#   make up             — start AuxDB + MongoDB containers and wait for healthy
-#   make setup          — full bootstrap: up → AuxDB tables → MongoDB indexes
-#   make seed-snapshot  — write today's Parquet snapshot directory
-#   make seed-movement  — append a new batch of Avro movement part files
-#   make seed-backlog   — insert synthetic backlog rows into AuxDB (N=20 per table by default)
-#   make down           — stop containers (keep volumes)
-#   make reset          — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make up                  — start AuxDB + MongoDB containers and wait for healthy
+#   make setup               — full bootstrap: up → AuxDB tables → MongoDB indexes
+#   make seed-snapshot       — write today's Parquet snapshot directory (one shot)
+#   make seed-movement       — append a new batch of Avro movement part files (one shot)
+#   make seed-backlog        — insert synthetic backlog rows into AuxDB (one shot, N=20/table by default)
+#   make seed-snapshot-loop  — keep writing a new day's snapshot every SEED_INTERVAL seconds, until Ctrl+C
+#   make seed-movement-loop  — keep appending new movement batches every SEED_INTERVAL seconds, until Ctrl+C
+#   make seed-backlog-loop   — keep inserting new backlog rows every SEED_INTERVAL seconds, until Ctrl+C
+#   make down                — stop containers (keep volumes)
+#   make reset               — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make clean-destination   — empty inventory_snapshots/stock_movements (keep indexes)
 #
 # EXECUTION ORDER:
 #   make setup
 #   make seed-snapshot
 #   make seed-movement
+#   make seed-backlog   — pre-populate backlog tables so error handling has data to show
 #   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement) — no ordering constraint
 
 ifeq ($(OS),Windows_NT)
@@ -92,8 +97,11 @@ NEW_MOVEMENTS   ?= 2000
 MOVEMENT_ROWS_PER_PART ?= 500
 FAULT_RATE      ?= 5
 N               ?= 20
+# Seconds between iterations for the *-loop targets below.
+SEED_INTERVAL   ?= 15
 
-.PHONY: up down reset setup seed-snapshot seed-movement seed-backlog
+.PHONY: up down reset setup seed-snapshot seed-movement seed-backlog \
+        seed-snapshot-loop seed-movement-loop seed-backlog-loop clean-destination
 
 ## Start all containers
 up:
@@ -119,6 +127,13 @@ reset:
 	docker compose -f $(COMPOSE_FILE) down -v
 	@echo ">>> Volumes destroyed"
 
+## Empty inventory_snapshots/stock_movements without dropping their unique indexes
+clean-destination:
+	@echo ">>> Deleting all documents from inventory_snapshots and stock_movements..."
+	docker exec fc_mongo mongosh --quiet -u etl_user -p etl_pass --authenticationDatabase admin fc_inventory \
+		--eval "db.inventory_snapshots.deleteMany({}); db.stock_movements.deleteMany({});"
+	@echo ">>> Destination clean"
+
 ## Full bootstrap: start containers → AuxDB tables → MongoDB indexes
 setup: up
 	@echo ">>> Downloading Go dependencies..."
@@ -133,6 +148,7 @@ setup: up
 	@echo ">>> Setup complete. Next steps:"
 	@echo "   make seed-snapshot   - write today's Parquet snapshot directory"
 	@echo "   make seed-movement   - append a batch of Avro movement part files"
+	@echo "   make seed-backlog    - pre-populate backlog tables to showcase error handling"
 	@echo "   Start flows: pid=36 (Parquet snapshot) and pid=37 (Avro movement)"
 
 ## Write today's Parquet snapshot directory (or SNAPSHOT_DATE=YYYY-MM-DD)
@@ -142,6 +158,25 @@ seed-snapshot:
 		-total $(TOTAL_ROWS) -rows-per-part $(ROWS_PER_PART) -fault-rate $(FAULT_RATE) $(if $(SNAPSHOT_DATE),-date $(SNAPSHOT_DATE),)
 	@echo ">>> Snapshot seed complete"
 
+## Keep writing a new day's snapshot every SEED_INTERVAL seconds (advances one day per
+## iteration so each pass is a distinct dt=<date> partition, simulating daily rotation
+## on fast-forward). Ctrl+C to stop.
+seed-snapshot-loop:
+	@echo ">>> Looping seed-snapshot every $(SEED_INTERVAL)s (Ctrl+C to stop)..."
+	@i=0; \
+	while true; do \
+		epoch=$$(( $$(date -u +%s) + i*86400 )); \
+		case "$$(uname -s)" in \
+			Darwin) d=$$(date -u -r $$epoch +%Y-%m-%d) ;; \
+			*)      d=$$(date -u -d @$$epoch +%Y-%m-%d) ;; \
+		esac; \
+		echo ">>> [seed-snapshot-loop] iteration $$i -> dt=$$d"; \
+		FC_SNAPSHOT_DIR="$(FC_SNAPSHOT_DIR)" go run ./cmd/snapshot_seeder \
+			-date $$d -total $(TOTAL_ROWS) -rows-per-part $(ROWS_PER_PART) -fault-rate $(FAULT_RATE); \
+		i=$$((i+1)); \
+		sleep $(SEED_INTERVAL); \
+	done
+
 ## Append a new batch of Avro movement part files
 seed-movement:
 	@echo ">>> Seeding Avro movement directory..."
@@ -149,8 +184,31 @@ seed-movement:
 		-new $(NEW_MOVEMENTS) -rows-per-part $(MOVEMENT_ROWS_PER_PART) -fault-rate $(FAULT_RATE)
 	@echo ">>> Movement seed complete"
 
+## Keep appending new movement batches every SEED_INTERVAL seconds. Ctrl+C to stop.
+seed-movement-loop:
+	@echo ">>> Looping seed-movement every $(SEED_INTERVAL)s (Ctrl+C to stop)..."
+	@i=0; \
+	while true; do \
+		echo ">>> [seed-movement-loop] iteration $$i"; \
+		FC_MOVEMENT_DIR="$(FC_MOVEMENT_DIR)" go run ./cmd/movement_seeder \
+			-new $(NEW_MOVEMENTS) -rows-per-part $(MOVEMENT_ROWS_PER_PART) -fault-rate $(FAULT_RATE); \
+		i=$$((i+1)); \
+		sleep $(SEED_INTERVAL); \
+	done
+
 ## Insert synthetic backlog rows into AuxDB (N=20 per table by default)
 seed-backlog:
 	@echo ">>> Seeding synthetic backlog rows (N=$(N))..."
 	AUXDB_DSN="$(AUXDB_DSN)" go run ./cmd/backlog_seeder -n $(N)
 	@echo ">>> Backlog seed complete"
+
+## Keep inserting new backlog rows every SEED_INTERVAL seconds. Ctrl+C to stop.
+seed-backlog-loop:
+	@echo ">>> Looping seed-backlog every $(SEED_INTERVAL)s (Ctrl+C to stop)..."
+	@i=0; \
+	while true; do \
+		echo ">>> [seed-backlog-loop] iteration $$i"; \
+		AUXDB_DSN="$(AUXDB_DSN)" go run ./cmd/backlog_seeder -n $(N); \
+		i=$$((i+1)); \
+		sleep $(SEED_INTERVAL); \
+	done

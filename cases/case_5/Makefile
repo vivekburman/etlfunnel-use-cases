@@ -21,6 +21,7 @@
 #   make seeds-hot         — continuous: run both Postgres + Oracle seeders in parallel (Ctrl-C stops both)
 #   make down              — stop containers (keep volumes)
 #   make reset             — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make clean-destination — empty the pf_products ES index (keep index/mapping)
 #
 # ORACLE (Flow 33 source — manual license required, run once):
 #   docker login container-registry.oracle.com
@@ -60,7 +61,7 @@ HOT_INTERVAL    ?= 5s
 ORACLE_HOT_BATCH     ?= 10
 ORACLE_HOT_INTERVAL  ?= 5s
 
-.PHONY: up down reset setup seed seed-hot seeds-hot oracle-setup oracle-seed-hot
+.PHONY: up down reset setup seed seed-hot seeds-hot oracle-setup oracle-seed-hot clean-destination
 
 ## Start all containers
 up:
@@ -85,6 +86,14 @@ down:
 reset:
 	docker compose -f $(COMPOSE_FILE) down -v
 	@echo ">>> Volumes destroyed"
+
+## Empty the pf_products ES index without dropping the index/mapping
+clean-destination:
+	@echo ">>> Deleting all documents from pf_products..."
+	docker exec pf_elasticsearch curl -s -X POST "localhost:9200/pf_products/_delete_by_query" \
+		-H 'Content-Type: application/json' -d '{"query":{"match_all":{}}}'
+	@echo ""
+	@echo ">>> Destination clean"
 
 ## Full bootstrap: start containers → AuxDB tables → ES index → initial Postgres seed
 setup: up
