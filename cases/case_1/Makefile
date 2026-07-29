@@ -9,6 +9,7 @@
 #   make seed-scale  — scale seed (100K rec/shard, split cap 50K → forces dynamic table splits)
 #   make down        — stop and remove containers (keeps volumes)
 #   make reset       — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make clean-destination — empty destination_db tables (keep schema/indexes)
 
 ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
@@ -23,7 +24,7 @@ RECORDS_PER_SHARD ?= 500
 WORKERS ?= 4
 SPLIT_ROW_CAP ?= 1000000
 
-.PHONY: up down reset seed seed-scale setup
+.PHONY: up down reset seed seed-scale setup clean-destination
 
 ## Start all 6 containers
 up:
@@ -94,3 +95,14 @@ down:
 reset:
 	@echo "WARNING: This will destroy all data volumes!"
 	docker compose -f $(COMPOSE_FILE) down -v
+
+## Empty destination_db tables (raw/staging/curated/audit) without dropping schema/indexes
+clean-destination:
+	@echo ">>> Truncating destination_db tables..."
+	docker exec destination_db psql -U etl_user -d destination_db -c "TRUNCATE TABLE \
+		raw.customers, raw.subscriptions, raw.billing_accounts, raw.sim_inventory, raw.port_history, \
+		staging.customers, staging.subscriptions, staging.billing_accounts, staging.sim_inventory, staging.port_history, \
+		curated.customers, curated.subscriptions, curated.billing_accounts, curated.sim_inventory, curated.port_history, curated.network_assignments, curated.customer_merge_log, \
+		audit.audit_trail \
+		RESTART IDENTITY;"
+	@echo ">>> Destination clean"

@@ -9,6 +9,7 @@
 #   make seed-scale   — scale seed (100K rec/city, split cap 50K → forces dynamic splits)
 #   make down         — stop and remove containers (keeps volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
+#   make clean-destination — empty the platform_orders ES index (keep index/mapping)
 #
 # HOT PIPELINE (live Postgres writer — makes WAL pile up for the ETL to consume):
 #   make hot          — start the live order generator (runs until Ctrl+C)
@@ -33,7 +34,7 @@ SPLIT_ROW_CAP    ?= 1000000
 AUXDB_DSN  ?= host=localhost port=5445 dbname=auxdb user=etl_user password=etl_pass sslmode=disable
 ES_URL     ?= http://localhost:9200
 
-.PHONY: up down reset seed seed-scale setup hot
+.PHONY: up down reset seed seed-scale setup hot clean-destination
 
 ## Start all 7 containers
 up:
@@ -104,6 +105,14 @@ down:
 reset:
 	@echo "WARNING: This will destroy all data volumes!"
 	docker compose -f $(COMPOSE_FILE) down -v
+
+## Empty the platform_orders ES index without dropping the index/mapping
+clean-destination:
+	@echo ">>> Deleting all documents from platform_orders..."
+	docker exec elasticsearch curl -s -u elastic:etl_pass -X POST "localhost:9200/platform_orders/_delete_by_query" \
+		-H 'Content-Type: application/json' -d '{"query":{"match_all":{}}}'
+	@echo ""
+	@echo ">>> Destination clean"
 
 # ── Hot Pipeline ─────────────────────────────────────────────────────────────
 # Prereq: make setup must have completed (containers healthy, schemas created,
