@@ -59,6 +59,7 @@
 #   make down                — stop containers (keep volumes)
 #   make reset               — stop containers AND destroy volumes (DESTRUCTIVE)
 #   make clean-destination   — empty inventory_snapshots/stock_movements (keep indexes)
+#   make clean-auxdb         — empty AuxDB runtime tables (snapshot/movement progress + backlog)
 #
 # EXECUTION ORDER:
 #   make setup
@@ -101,7 +102,7 @@ N               ?= 20
 SEED_INTERVAL   ?= 15
 
 .PHONY: up down reset setup seed-snapshot seed-movement seed-backlog \
-        seed-snapshot-loop seed-movement-loop seed-backlog-loop clean-destination
+        seed-snapshot-loop seed-movement-loop seed-backlog-loop clean-destination clean-auxdb
 
 ## Start all containers
 up:
@@ -133,6 +134,14 @@ clean-destination:
 	docker exec fc_mongo mongosh --quiet -u etl_user -p etl_pass --authenticationDatabase admin fc_inventory \
 		--eval "db.inventory_snapshots.deleteMany({}); db.stock_movements.deleteMany({});"
 	@echo ">>> Destination clean"
+
+## Empty AuxDB runtime tables (snapshot/movement progress + backlog)
+clean-auxdb:
+	@echo ">>> Truncating AuxDB runtime tables..."
+	docker exec fc_auxdb psql -U etl_user -d auxdb -c "TRUNCATE TABLE \
+		fc_snapshot_progress, fc_snapshot_backlog, fc_movement_progress, fc_movement_backlog \
+		RESTART IDENTITY;"
+	@echo ">>> AuxDB runtime state clean"
 
 ## Full bootstrap: start containers → AuxDB tables → MongoDB indexes
 setup: up

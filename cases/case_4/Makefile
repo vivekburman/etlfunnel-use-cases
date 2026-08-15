@@ -15,6 +15,7 @@
 #   make down         — stop containers (keep volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
 #   make clean-destination — empty zepto_events.order_events (keep keyspace/table)
+#   make clean-auxdb  — empty AuxDB runtime tables (cursors, offsets, backlog)
 #
 # SEED OVERRIDES:
 #   make seed TOTAL_EVENTS=5000 SEEDER_PORT=11334
@@ -44,7 +45,7 @@ FAULT_RATE   ?= 5
 
 BACKLOG_N    ?= 20
 
-.PHONY: up down reset setup seed seed-stop seed-backlog clean-destination
+.PHONY: up down reset setup seed seed-stop seed-backlog clean-destination clean-auxdb
 
 ## Start AuxDB + Kafka + Cassandra containers
 up:
@@ -75,6 +76,14 @@ clean-destination:
 	@echo ">>> Truncating zepto_events.order_events..."
 	docker exec zepto_cassandra cqlsh -e "TRUNCATE zepto_events.order_events;"
 	@echo ">>> Destination clean"
+
+## Empty AuxDB runtime tables (ingestion cursors/backlog, storage offsets/backlog)
+clean-auxdb:
+	@echo ">>> Truncating AuxDB runtime tables..."
+	docker exec zepto_auxdb psql -U etl_user -d auxdb -c "TRUNCATE TABLE \
+		zepto_ingestion_cursors, zepto_ingestion_backlog, zepto_storage_offsets, zepto_storage_backlog \
+		RESTART IDENTITY;"
+	@echo ">>> AuxDB runtime state clean"
 
 ## Full bootstrap: start containers → AuxDB tables → Cassandra keyspace/table
 setup: up

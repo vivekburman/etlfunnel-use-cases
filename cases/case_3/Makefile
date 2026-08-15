@@ -10,6 +10,7 @@
 #   make down         — stop containers (keep volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
 #   make clean-destination — empty analytics_warehouse tables (keep schema/indexes)
+#   make clean-auxdb  — empty AuxDB runtime/state tables (keeps seeded reference data)
 #
 # SEED OVERRIDES:
 #   make seed ROWS_PER_DAY=5000 SEEDER_PORT=11333
@@ -38,7 +39,7 @@ AUXDB_DSN      ?= host=localhost port=5446 dbname=auxdb user=etl_user password=e
 SEEDER_PORT    ?= 11333
 ROWS_PER_DAY   ?= 15000
 
-.PHONY: up down reset setup seed seed-stop clean-destination
+.PHONY: up down reset setup seed seed-stop clean-destination clean-auxdb
 
 ## Start SQL Server + AuxDB containers
 up:
@@ -70,6 +71,15 @@ clean-destination:
 	docker exec $(MSSQL_CONTAINER) /opt/mssql-tools18/bin/sqlcmd -S localhost -U $(MSSQL_USER) -P "$(MSSQL_PASS)" -C -d $(MSSQL_DB) \
 		-Q "TRUNCATE TABLE dbo.ga4_sessions; TRUNCATE TABLE stage.ga4_sessions; TRUNCATE TABLE dbo.realtime_sessions; TRUNCATE TABLE dbo.pipeline_run_log;"
 	@echo ">>> Destination clean"
+
+## Empty AuxDB runtime/state tables (checkpoints, backlog, run log)
+## without touching seeded reference tables (terminate_rules, write_tune_config)
+clean-auxdb:
+	@echo ">>> Truncating AuxDB runtime tables..."
+	docker exec auxdb psql -U etl_user -d auxdb -c "TRUNCATE TABLE \
+		pipeline_checkpoints, pipeline_backlog, pipeline_run_log \
+		RESTART IDENTITY;"
+	@echo ">>> AuxDB runtime state clean"
 
 ## Full bootstrap: start containers → AuxDB schema → SQL Server schema
 setup: up

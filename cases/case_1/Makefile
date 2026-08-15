@@ -10,6 +10,7 @@
 #   make down        — stop and remove containers (keeps volumes)
 #   make reset       — stop containers AND destroy volumes (DESTRUCTIVE)
 #   make clean-destination — empty destination_db tables (keep schema/indexes)
+#   make clean-auxdb — empty AuxDB runtime/state tables (keeps seeded reference data)
 
 ifeq ($(OS),Windows_NT)
 SHELL := C:/Program Files/Git/bin/bash.exe
@@ -24,7 +25,7 @@ RECORDS_PER_SHARD ?= 500
 WORKERS ?= 4
 SPLIT_ROW_CAP ?= 1000000
 
-.PHONY: up down reset seed seed-scale setup clean-destination
+.PHONY: up down reset seed seed-scale setup clean-destination clean-auxdb
 
 ## Start all 6 containers
 up:
@@ -106,3 +107,13 @@ clean-destination:
 		audit.audit_trail \
 		RESTART IDENTITY;"
 	@echo ">>> Destination clean"
+
+## Empty AuxDB runtime/state tables (checkpoints, backlog, dedup, reconciliation, audit, merge log)
+## without touching seeded reference tables (plan_mapping, terminate_rules, write_tune_config)
+clean-auxdb:
+	@echo ">>> Truncating AuxDB runtime tables..."
+	docker exec auxdb psql -U etl_user -d auxdb -c "TRUNCATE TABLE \
+		pipeline_checkpoints, backlog_records, dedup_registry, \
+		reconciliation_log, audit_trail, customer_merge_log \
+		RESTART IDENTITY;"
+	@echo ">>> AuxDB runtime state clean"

@@ -22,6 +22,7 @@
 #   make down              — stop containers (keep volumes)
 #   make reset             — stop containers AND destroy volumes (DESTRUCTIVE)
 #   make clean-destination — empty the pf_products ES index (keep index/mapping)
+#   make clean-auxdb       — empty AuxDB runtime tables (checkpoints, cursors, offsets, backlogs)
 #
 # ORACLE (Flow 33 source — manual license required, run once):
 #   docker login container-registry.oracle.com
@@ -61,7 +62,7 @@ HOT_INTERVAL    ?= 5s
 ORACLE_HOT_BATCH     ?= 10
 ORACLE_HOT_INTERVAL  ?= 5s
 
-.PHONY: up down reset setup seed seed-hot seeds-hot oracle-setup oracle-seed-hot clean-destination
+.PHONY: up down reset setup seed seed-hot seeds-hot oracle-setup oracle-seed-hot clean-destination clean-auxdb
 
 ## Start all containers
 up:
@@ -94,6 +95,15 @@ clean-destination:
 		-H 'Content-Type: application/json' -d '{"query":{"match_all":{}}}'
 	@echo ""
 	@echo ">>> Destination clean"
+
+## Empty AuxDB runtime tables (checkpoints, cursors, offsets, backlogs)
+clean-auxdb:
+	@echo ">>> Truncating AuxDB runtime tables..."
+	docker exec pf_auxdb psql -U etl_user -d auxdb -c "TRUNCATE TABLE \
+		pf_catalog_checkpoints, pf_enrich_collect_cursors, pf_enrich_submit_offsets, \
+		pf_postgres_ingest_backlog, pf_oracle_ingest_backlog, pf_enrich_submit_backlog, pf_es_index_backlog \
+		RESTART IDENTITY;"
+	@echo ">>> AuxDB runtime state clean"
 
 ## Full bootstrap: start containers → AuxDB tables → ES index → initial Postgres seed
 setup: up

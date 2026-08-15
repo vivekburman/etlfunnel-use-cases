@@ -10,6 +10,7 @@
 #   make down         — stop and remove containers (keeps volumes)
 #   make reset        — stop containers AND destroy volumes (DESTRUCTIVE)
 #   make clean-destination — empty the platform_orders ES index (keep index/mapping)
+#   make clean-auxdb  — empty AuxDB runtime/state tables (keeps seeded reference data)
 #
 # HOT PIPELINE (live Postgres writer — makes WAL pile up for the ETL to consume):
 #   make hot          — start the live order generator (runs until Ctrl+C)
@@ -34,7 +35,7 @@ SPLIT_ROW_CAP    ?= 1000000
 AUXDB_DSN  ?= host=localhost port=5445 dbname=auxdb user=etl_user password=etl_pass sslmode=disable
 ES_URL     ?= http://localhost:9200
 
-.PHONY: up down reset seed seed-scale setup hot clean-destination
+.PHONY: up down reset seed seed-scale setup hot clean-destination clean-auxdb
 
 ## Start all 7 containers
 up:
@@ -113,6 +114,16 @@ clean-destination:
 		-H 'Content-Type: application/json' -d '{"query":{"match_all":{}}}'
 	@echo ""
 	@echo ">>> Destination clean"
+
+## Empty AuxDB runtime/state tables (checkpoints, backlog, WAL positions, backfill progress, write logs)
+## without touching seeded reference tables (city_mapping, brand_sla_rules, terminate_rules, write_tune_config)
+clean-auxdb:
+	@echo ">>> Truncating AuxDB runtime tables..."
+	docker exec auxdb psql -U etl_user -d auxdb -c "TRUNCATE TABLE \
+		pipeline_checkpoints, backlog_records, wal_positions, backfill_progress, \
+		es_write_log, backfill_completion_log \
+		RESTART IDENTITY;"
+	@echo ">>> AuxDB runtime state clean"
 
 # ── Hot Pipeline ─────────────────────────────────────────────────────────────
 # Prereq: make setup must have completed (containers healthy, schemas created,
