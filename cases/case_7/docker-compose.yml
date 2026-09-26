@@ -1,0 +1,81 @@
+version: "3.9"
+
+networks:
+  case7_net:
+    driver: bridge
+
+volumes:
+  payments_data:
+  auxdb_data:
+  es_data:
+
+services:
+
+  payments_db:
+    image: postgres:15
+    container_name: case7_payments_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: payments_db
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      - payments_data:/var/lib/postgresql/data
+    networks:
+      - case7_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d payments_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  auxdb:
+    image: postgres:15
+    container_name: case7_auxdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auxdb
+      POSTGRES_USER: etl_user
+      POSTGRES_PASSWORD: etl_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5435:5432"
+    volumes:
+      - auxdb_data:/var/lib/postgresql/data
+    networks:
+      - case7_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl_user -d auxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.1
+    container_name: case7_elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - case7_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # Snowflake is not here on purpose - no local emulator exists (see the
+  # case study plan's Part 5.1). Point cmd/snowflake_setup and the execution
+  # engine's collection.json at a live trial account instead.

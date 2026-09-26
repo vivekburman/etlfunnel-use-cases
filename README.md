@@ -76,6 +76,17 @@ The defining mechanic is the framework's file I/O model: the connector never sca
 
 </details>
 
+<details>
+<summary><strong>Case 7 — Payments Reconciliation & Fraud Intelligence: Postgres → Snowflake → Snowflake → Elasticsearch</strong> (design)</summary>
+
+The first case to put a data warehouse in the middle of a chain instead of at the end. A fictional payments aggregator's PostgreSQL transaction log lands in Snowflake, gets joined against a merchant risk profile and reconciled entirely in SQL via a Snowflake Stream + `MERGE` (source and destination are the same Snowflake account — a "transform" flow with no new business data arriving from outside), and the curated result syncs to Elasticsearch so a fraud/support UI gets sub-second lookups instead of querying the warehouse directly.
+
+Snowflake has no local emulator, so — like Cases 5 and 6 — this is a design-first case: docker-compose covers Postgres, AuxDB and Elasticsearch, but Snowflake is a bring-your-own 30-day/$400-credit trial account reached via key-pair auth, with a `make snowflake-setup` target instead of a container. The write-up centers on that constraint directly: the framework's Snowflake destination is one round trip per `ExecContext`, not a bulk loader, so Flow 1 batches multi-row `INSERT`s to cut round trips, Flow 2's `MERGE` accepts one round trip per record because each row needs its own risk-profile join, and every flow carries a hard `MaxPipelineTime` because a stuck query keeps the warehouse (and the credit meter) alive until Snowflake itself sees the cancel.
+
+**Stack:** Go, PostgreSQL, Snowflake (Streams + `MERGE`, key-pair auth), Elasticsearch, PostgreSQL (AuxDB), Docker Compose · [Case study plan](cases/case_7/case_7_etl_casestudy_plan.md)
+
+</details>
+
 ---
 
 ## How to use this repo
